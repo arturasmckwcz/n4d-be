@@ -1,3 +1,5 @@
+export * from "./by-day-code";
+export * from "./fetch-file";
 export * from "./fetch-json";
 export * from "./get-district";
 export * from "./get-opportunity-representative-person";
@@ -8,6 +10,7 @@ export * from "./getLoggingForDataSource";
 export * from "./getRRULE";
 export * from "./getStartEndDates";
 export * from "./hash-token";
+export * from "./log-match-change";
 export * from "./passwd";
 export * from "./remove-data";
 export * from "./update-opportunity-matching";

@@ -7,7 +7,8 @@ import {
 import OpportunityVolunteer from "../../../data/entity/m2m/opportunity-volunteer";
 import { formatScheduleLocalized } from "../../dto/utils";
 import { SUGGESTION_BUILTIN as BUILTIN } from "../builtin-content";
-import { createManifestLoader, renderEmail } from "../email-template";
+import { createManifestLoader, renderEmailWithNote } from "../email-template";
+import { localizedOpportunityTitle } from "../opportunity-title";
 import {
   OPPORTUNITY_SCHEDULE_LABELS,
   resolveOrAlert,
@@ -16,6 +17,18 @@ import type { EmailTransport } from "../types";
 
 const loader = createManifestLoader(emailSuggestionManifestUrl);
 
+const SCHEDULE_FALLBACK = {
+  [Lang.EN]: "to be confirmed",
+  [Lang.DE]: "wird noch abgestimmt",
+};
+
+const ONE_OF_THESE_TIMES_NOTE = {
+  [Lang.EN]: " (you only need to be available at one of these times)",
+  [Lang.DE]: " (du musst nur zu einer dieser Zeiten verfügbar sein)",
+};
+
+const NO_NOTE = { [Lang.EN]: "", [Lang.DE]: "" };
+
 export function resetSuggestionTemplateCache(): void {
   loader.resetCache();
 }
@@ -23,10 +36,8 @@ export function resetSuggestionTemplateCache(): void {
 export async function sendEmailSuggestion(
   email: EmailTransport,
   ov: OpportunityVolunteer,
-  // Bypasses dry-run redirection, same as ValidatingEmailTransport's
-  // errorTransport (be#847) — defaults to `email` for callers that don't
-  // care about that distinction (e.g. tests with a single mock transport).
   errorTransport: EmailTransport = email,
+  emailNote?: string,
 ): Promise<void> {
   const volunteerEmail = ov.volunteer?.person?.email;
   if (!volunteerEmail) {
@@ -36,34 +47,35 @@ export async function sendEmailSuggestion(
   }
 
   const volunteerName = ov.volunteer.person.name;
-  const opportunityName = ov.opportunity?.title ?? "";
-  // The opportunity's own location/schedule, not the volunteer's — this
-  // email describes where and when the *opportunity* takes place, so
-  // reading from ov.volunteer.deal here (as this used to) instead read back
-  // the volunteer's own postcode/general availability, unrelated to the
-  // specific opportunity being suggested (fe#1036 / be schedule bug).
+  const opportunityName = await localizedOpportunityTitle(ov.opportunity);
   const plz = ov.opportunity?.deal?.postcode?.value ?? "";
+  const dealTimeslot = ov.opportunity?.deal?.dealTimeslot ?? [];
   const opportunitySchedule = await resolveOrAlert(
     errorTransport,
-    ov.opportunity?.deal?.dealTimeslot ?? [],
+    dealTimeslot,
     formatScheduleLocalized,
-    { [Lang.EN]: "to be confirmed", [Lang.DE]: "wird noch abgestimmt" },
+    SCHEDULE_FALLBACK,
     `sendEmailSuggestion, ov ${ov.id}`,
     OPPORTUNITY_SCHEDULE_LABELS,
   );
+  const scheduleNote =
+    opportunitySchedule !== SCHEDULE_FALLBACK && dealTimeslot.length > 1
+      ? ONE_OF_THESE_TIMES_NOTE
+      : NO_NOTE;
 
-  const { subject, text, html } = renderEmail(await loader.load(), BUILTIN, {
-    volunteerName,
-    opportunityName,
-    plz,
-    opportunitySchedule,
-    // TODO(be#1042 review): remove once the live CDN suggestion.json uses
-    // {{ opportunitySchedule.en }} / {{ opportunitySchedule.de }} instead of
-    // {{ schedule }} — until then its plain {{ schedule }} leaves the
-    // language open, so renderEmail() sends the builtin (be#1075) instead of
-    // the placeholder staying unresolved and the send being suspended.
-    schedule: opportunitySchedule,
-  });
+  const { subject, text, html } = renderEmailWithNote(
+    await loader.load(),
+    BUILTIN,
+    {
+      volunteerName,
+      opportunityName,
+      plz,
+      opportunitySchedule,
+      schedule: opportunitySchedule,
+      scheduleNote,
+    },
+    emailNote,
+  );
 
   await email.send({
     to: volunteerEmail,

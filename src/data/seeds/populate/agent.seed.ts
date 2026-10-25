@@ -15,6 +15,7 @@ import Agent from "../../entity/opportunity/agent.entity";
 import AgentType from "../../entity/profile/agent-type.entity";
 import Service from "../../entity/profile/service.entity";
 import { fetchJsonFromUrl, getRepository } from "../../utils";
+import { getDistrictFromPostcode } from "../../utils/get-district";
 import {
   getAgentEngagement,
   getAgentPersonRole,
@@ -24,6 +25,7 @@ import {
   getAgentType,
   getCount,
   getEnumValue,
+  getOrCreateAddress,
   getOrCreatePerson,
 } from "../utils";
 import { AgentJSON } from "./types";
@@ -42,7 +44,6 @@ export async function seedAgents(dataSource: DataSource): Promise<void> {
 
   const agentsJson = (await fetchJsonFromUrl(seedAgentsFile)) as AgentJSON[];
 
-  // create an agent for orphan opportunities
   agentsJson.unshift({
     title: titleOrphanageAgent,
     about: "the dummy agent account for parenting orphaned opportunities.",
@@ -50,16 +51,24 @@ export async function seedAgents(dataSource: DataSource): Promise<void> {
 
   for (const agentJson of agentsJson ?? []) {
     const agentTypeKey = getAgentType(agentJson.type);
-    // GU2+ is not a category of its own — merged into GU2 (see the
-    // AddAgentTypeAndService migration's backfill for the same mapping).
     const agentTypeTitle =
       agentTypeKey === AgentTypeKey.GU2_PLUS ? AgentTypeKey.GU2 : agentTypeKey;
     const agentType = agentTypeTitle
       ? await agentTypeRepository.findOneBy({ title: agentTypeTitle })
       : null;
 
+    const address = agentJson.address
+      ? await getOrCreateAddress(agentJson.address, dataSource)
+      : undefined;
+    const district = await getDistrictFromPostcode(
+      address?.postcode,
+      dataSource,
+    );
+
     const agentObj = new Agent({
       title: agentJson.title || agentJson.website || "unknown",
+      address,
+      districtId: district?.id,
       info: agentJson.about,
       website: agentJson.website,
       agentTypeId: agentType?.id,

@@ -8,26 +8,6 @@ import { In } from "typeorm";
 import User from "../../../data/entity/user.entity";
 import { getCallerAgentIds } from "../data/get-caller-agent-ids";
 
-/**
- * What a non COORDINATOR/ADMIN caller may see UNMASKED, resolved per request
- * (masking-side only). Drives PII masking of persons, an opportunity's
- * accompanying details, and comments.
- *
- *   userId          the caller's user id (a comment they authored is unmasked)
- *   role            the caller's role (a VOLUNTEER also gets agent titles masked)
- *   personIds       Person ids whose PII is visible
- *   opportunityIds  Opportunities whose accompanying + comments are visible
- *   agentIds        Agents whose comments are visible (caller's memberships)
- *   matchedAgentIds Agents (RACs) whose title + address are visible, but not
- *                   their comments: those of the opportunities a VOLUNTEER
- *                   is matched to (be#1039)
- *
- * Per role:
- *   USER      -> nothing
- *   VOLUNTEER -> own person; opportunities they're matched to, and their agents
- *   AGENT     -> own person ∪ members of their agent(s) ∪ persons of volunteers
- *                on their opportunities; their agent(s); their opportunities
- */
 export interface CallerVisibility {
   userId: number;
   role: UserRole;
@@ -35,41 +15,51 @@ export interface CallerVisibility {
   opportunityIds: Set<number>;
   agentIds: Set<number>;
   matchedAgentIds: Set<number>;
+  ownerAgentIds: Set<number>;
 }
 
-// Match statuses that count as "matched" for a VOLUNTEER's visibility
-// (be#1039): a PENDING suggestion doesn't unlock the RAC/refugee details yet,
-// and a PAST engagement no longer does.
 export const VISIBLE_MATCH_STATUSES = [
   OpportunityVolunteerStatusType.MATCHED,
   OpportunityVolunteerStatusType.ACTIVE,
 ];
+
+export function anonymousVisibility(): CallerVisibility {
+  return {
+    userId: 0,
+    role: UserRole.USER,
+    personIds: new Set<number>(),
+    opportunityIds: new Set<number>(),
+    agentIds: new Set<number>(),
+    matchedAgentIds: new Set<number>(),
+    ownerAgentIds: new Set<number>(),
+  };
+}
 
 export async function resolveCallerVisibility(
   request: FastifyRequest,
   user: User,
 ): Promise<CallerVisibility> {
   const visibility: CallerVisibility = {
+    ...anonymousVisibility(),
     userId: user.id,
     role: user.role,
-    personIds: new Set<number>(),
-    opportunityIds: new Set<number>(),
-    agentIds: new Set<number>(),
-    matchedAgentIds: new Set<number>(),
   };
-  const { personIds, opportunityIds, agentIds, matchedAgentIds } = visibility;
+  const {
+    personIds,
+    opportunityIds,
+    agentIds,
+    matchedAgentIds,
+    ownerAgentIds,
+  } = visibility;
   const personId = user.personId ?? undefined;
 
-  // USER sees only reference data; a missing personId can't match anything.
   if (user.role === UserRole.USER || !personId) {
     return visibility;
   }
 
-  personIds.add(personId); // VOLUNTEER + AGENT see their own person
+  personIds.add(personId);
 
   if (user.role === UserRole.VOLUNTEER) {
-    // Opportunities the caller is matched to (own person -> volunteer ->
-    // match), and the agents (RACs) owning them.
     const rows: { opportunity_id: number; agent_id: number | null }[] =
       await request.server.db.agentPersonRepository.manager.query(
         `SELECT ov.opportunity_id, o.agent_id
@@ -101,25 +91,38 @@ export async function resolveCallerVisibility(
     return visibility;
   }
 
-  // Members of the caller's agent(s).
   const members = await agentPersonRepository.find({
     where: { agentId: In([...agentIds]), status: AgentMembershipStatus.ACTIVE },
   });
   members.forEach((m) => personIds.add(m.personId));
 
-  // Opportunities owned by the caller's agent(s), plus the persons of the
-  // volunteers matched to them (an agent member sees those volunteers).
+  agentIds.forEach((id) => ownerAgentIds.add(id));
+
   const rows: { id: number; person_id: number | null }[] =
     await agentPersonRepository.manager.query(
       `SELECT o.id, v.person_id
          FROM opportunity o
          LEFT JOIN opportunity_volunteer ov ON ov.opportunity_id = o.id
          LEFT JOIN volunteer v ON v.id = ov.volunteer_id
+          AND (v.owner_agent_id IS NULL
+               OR v.owner_agent_id = ANY($1)
+               OR ov.status = ANY($2))
         WHERE o.agent_id = ANY($1)`,
-      [[...agentIds]],
+      [[...agentIds], VISIBLE_MATCH_STATUSES],
     );
   rows.forEach((r) => {
     opportunityIds.add(Number(r.id));
+    if (r.person_id !== null) {
+      personIds.add(Number(r.person_id));
+    }
+  });
+
+  const owned: { person_id: number | null }[] =
+    await agentPersonRepository.manager.query(
+      `SELECT person_id FROM volunteer WHERE owner_agent_id = ANY($1)`,
+      [[...agentIds]],
+    );
+  owned.forEach((r) => {
     if (r.person_id !== null) {
       personIds.add(Number(r.person_id));
     }

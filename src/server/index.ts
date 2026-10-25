@@ -29,10 +29,13 @@ import optionRoutes from "./routes/option";
 import organizationRoutes from "./routes/organization.routes";
 import personRoutes from "./routes/person.routes";
 import postRoutes from "./routes/post.routes";
+import statisticsRoutes from "./routes/statistics.routes";
+import translationRoutes from "./routes/translation.routes";
 import trustedDomainRoutes from "./routes/trusted-domain.routes";
 import userRoutes from "./routes/user";
 import volunteerRoutes from "./routes/volunteer/volunteer.routes";
 import workerRoutes from "./routes/worker.routes";
+import { emailNoteSchema } from "./schema/email-note.schema";
 import entityTypesSchema from "./schema/entity-types.json";
 import optionListsSchema from "./schema/option-lists.json";
 import sdkTypesSchema from "./schema/sdk-types.json";
@@ -85,11 +88,11 @@ export async function createServer(): Promise<FastifyInstance> {
     },
   });
 
-  // Register external schemas first so they're available for $ref resolution
   await fastifyInstance.addSchema({
     $id: "entity-types",
     ...entityTypesSchema,
   });
+  await fastifyInstance.addSchema(emailNoteSchema);
   await fastifyInstance.addSchema({
     $id: "sdk-types",
     ...sdkTypesSchema,
@@ -216,6 +219,12 @@ export async function createServer(): Promise<FastifyInstance> {
   });
   await fastifyInstance.register(workerRoutes, {
     prefix: RoutePrefix.WORKER,
+  });
+  await fastifyInstance.register(translationRoutes, {
+    prefix: RoutePrefix.TRANSLATION,
+  });
+  await fastifyInstance.register(statisticsRoutes, {
+    prefix: RoutePrefix.STATISTICS,
   });
   await fastifyInstance.register(trustedDomainRoutes, {
     prefix: RoutePrefix.TRUSTED_DOMAIN,

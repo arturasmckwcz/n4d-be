@@ -6,7 +6,7 @@ import type {
   SlackTransport,
 } from "../types";
 
-const DRY_RUN_RECIPIENT = "test@need4deed.org";
+export const DRY_RUN_RECIPIENT = "test@need4deed.org";
 
 function count(addresses: string | string[] | undefined): number {
   if (!addresses) {
@@ -25,17 +25,23 @@ export class DryRunEmailTransport implements EmailTransport {
         ? msg.cc.join(", ")
         : msg.cc
       : undefined;
-    const prefix = originalCc
-      ? `[TO: ${originalTo} CC: ${originalCc}]`
-      : `[TO: ${originalTo}]`;
+    const originalReplyTo = msg.replyTo
+      ? Array.isArray(msg.replyTo)
+        ? msg.replyTo.join(", ")
+        : msg.replyTo
+      : undefined;
+    const prefix = `[${[
+      `TO: ${originalTo}`,
+      ...(originalCc ? [`CC: ${originalCc}`] : []),
+      ...(originalReplyTo ? [`REPLY-TO: ${originalReplyTo}`] : []),
+    ].join(" ")}]`;
     const redirected: EmailMessage = {
       ...msg,
       to: DRY_RUN_RECIPIENT,
       cc: undefined,
+      replyTo: undefined,
       subject: `${prefix} ${msg.subject}`,
     };
-    // Counts only: addresses and subjects are personal data. The redirected
-    // email itself shows them in its subject prefix.
     logger.info(
       `[notify:dry-run] redirecting email to ${DRY_RUN_RECIPIENT} — ${count(msg.to)} recipient(s), ${count(msg.cc)} cc`,
     );
@@ -45,7 +51,6 @@ export class DryRunEmailTransport implements EmailTransport {
 
 export class DryRunSlackTransport implements SlackTransport {
   async send(msg: SlackMessage): Promise<void> {
-    // The channel only: Slack texts can name people.
     logger.info(`[notify:dry-run] slack suppressed — channel: ${msg.channel}`);
   }
 }

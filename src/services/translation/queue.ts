@@ -5,6 +5,7 @@ import {
   TranslationStatus,
 } from "need4deed-sdk";
 import { EntityManager, FindOptionsWhere } from "typeorm";
+import { NotFoundError } from "../../config";
 import FieldTranslation from "../../data/entity/field_translation.entity";
 import { sha256Hex } from "../../data/utils/hash-token";
 import { languageIds, originalLang, TranslatableEntity } from "./languages";
@@ -14,10 +15,14 @@ import {
   TranslationFk,
 } from "./registry";
 
-// The source text a translation was made from; a different hash means the
-// translation is outdated.
+export type SourceEntity = TranslatableEntity & Record<string, unknown>;
+
 export function sourceHashOf(text: string): string {
   return sha256Hex(text);
+}
+
+export function sourceTextOf(value: unknown): string {
+  return String(value ?? "").trim();
 }
 
 function rowsOf(
@@ -28,20 +33,6 @@ function rowsOf(
   return { [fk]: entityId, ...extra } as FindOptionsWhere<FieldTranslation>;
 }
 
-/**
- * Queues machine translation of `fields` into every language other than the
- * entity's original one. Call it in the same transaction as the write that
- * changes the text, so text and source hash always change together.
- *
- * - unchanged text (same source hash) is left alone, whatever its state:
- *   done, failed, or a human translation;
- * - changed text resets the row to a pending machine translation, human
- *   rows included (epic decision 2: a translation of outdated text is worse
- *   than a fresh machine one);
- * - empty text removes the field's translations.
- *
- * No text leaves the server here; the worker does the translating.
- */
 export async function enqueue(
   manager: EntityManager,
   entityType: EntityTableName,
@@ -54,15 +45,13 @@ export async function enqueue(
   const repository = manager.getRepository(FieldTranslation);
 
   for (const [fieldName, value] of Object.entries(fields)) {
-    const text = value?.trim();
+    const text = sourceTextOf(value);
     if (!text) {
       await repository.delete(rowsOf(fk, entity.id, { fieldName }));
       continue;
     }
     const sourceHash = sourceHashOf(text);
 
-    // Translating into the original language is never wanted (be#1065:
-    // same-language input comes back reworded).
     await repository.delete(
       rowsOf(fk, entity.id, { fieldName, languageId: idOf[original] }),
     );
@@ -100,56 +89,36 @@ export async function enqueue(
   }
 }
 
-async function loadEntity(
+export async function loadEntity(
   manager: EntityManager,
   entityType: EntityTableName,
   entityId: number,
   fieldNames: string[],
 ) {
   const entry = getMachineEntry(entityType, fieldNames);
-  // The registry is generic over its tables; fields are read by name, and
-  // machineEntry has already checked they belong to this table.
   const entity = (await manager.findOneBy(entry.entity, {
     id: entityId,
-  })) as unknown as (TranslatableEntity & Record<string, unknown>) | null;
+  })) as unknown as SourceEntity | null;
   if (!entity) {
-    throw new Error(`${entityType} ${entityId} not found`);
+    throw new NotFoundError(`${entityType} (id:${entityId}) not found.`);
   }
   return { entry, entity };
 }
 
-/**
- * Stores a person's translation of the field's current text (be#1070:
- * a write in a language other than the original). Kept until the source
- * text changes; then enqueue re-translates it.
- */
-export async function setHuman(
+export async function storeHuman(
   manager: EntityManager,
-  entityType: EntityTableName,
-  entityId: number,
+  fk: TranslationFk,
+  entity: SourceEntity,
+  languageId: number,
   fieldName: string,
-  lang: Lang,
   text: string,
 ): Promise<void> {
-  const { entry, entity } = await loadEntity(manager, entityType, entityId, [
-    fieldName,
-  ]);
-  const { idOf, langOf } = await languageIds(manager);
-  if (lang === originalLang(entity, langOf)) {
-    throw new Error(
-      `${lang} is the original language of ${entityType} ${entityId}`,
-    );
-  }
-  const source = String(entity[fieldName] ?? "").trim();
-  const where = rowsOf(entry.fk, entityId, {
-    fieldName,
-    languageId: idOf[lang],
-  });
+  const where = rowsOf(fk, entity.id, { fieldName, languageId });
   const human = {
     origin: TranslationOrigin.HUMAN,
     status: TranslationStatus.DONE,
-    translation: text.trim(),
-    sourceHash: sourceHashOf(source),
+    translation: sourceTextOf(text),
+    sourceHash: sourceHashOf(sourceTextOf(entity[fieldName])),
     attempts: 0,
     lastErrorCode: null,
     model: null,
@@ -167,12 +136,26 @@ export async function setHuman(
   }
 }
 
-/**
- * A coordinator's correction of the language the text was typed in
- * (be#1070). The worker never changes it: model-based detection proved
- * unreliable (be#1065). Drops the translations into the new original
- * language and queues the ones now needed, including the previous one.
- */
+export async function setHuman(
+  manager: EntityManager,
+  entityType: EntityTableName,
+  entityId: number,
+  fieldName: string,
+  lang: Lang,
+  text: string,
+): Promise<void> {
+  const { entry, entity } = await loadEntity(manager, entityType, entityId, [
+    fieldName,
+  ]);
+  const { idOf, langOf } = await languageIds(manager);
+  if (lang === originalLang(entity, langOf)) {
+    throw new Error(
+      `${lang} is the original language of ${entityType} ${entityId}`,
+    );
+  }
+  await storeHuman(manager, entry.fk, entity, idOf[lang], fieldName, text);
+}
+
 export async function setOriginalLanguage(
   manager: EntityManager,
   entityType: EntityTableName,

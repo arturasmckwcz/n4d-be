@@ -25,6 +25,7 @@ import Organization from "../../data/entity/organization.entity";
 import Person from "../../data/entity/person.entity";
 import Post from "../../data/entity/post.entity";
 import Language from "../../data/entity/profile/language.entity";
+import RefreshSession from "../../data/entity/refresh-session.entity";
 import TrustedDomain from "../../data/entity/trusted-domain.entity";
 import User from "../../data/entity/user.entity";
 import Appreciation from "../../data/entity/volunteer/appreciation.entity";
@@ -40,7 +41,6 @@ const typeormPlugin: FastifyPluginAsync = async (fastify) => {
     }
     logger.info("TypeORM Data Source has been initialized!");
 
-    // Decorate the Fastify instance with repositories
     fastify.decorate("db", {
       apiKeyRepository: dataSource.getRepository(ApiKey),
       userRepository: dataSource.getRepository(User),
@@ -71,11 +71,11 @@ const typeormPlugin: FastifyPluginAsync = async (fastify) => {
       postRepository: dataSource.getRepository(Post),
       postReactionRepository: dataSource.getRepository(PostReaction),
       postBookmarkRepository: dataSource.getRepository(PostBookmark),
+      refreshSessionRepository: dataSource.getRepository(RefreshSession),
       trustedDomainRepository: dataSource.getRepository(TrustedDomain),
       volunteerAuditLogRepository: dataSource.getRepository(VolunteerAuditLog),
     });
 
-    // TODO: add validation of others
     if (!fastify.db.userRepository || !fastify.db.personRepository) {
       logger.error(
         "ERROR: Repositories were not correctly initialized on fastify.db",
@@ -83,7 +83,6 @@ const typeormPlugin: FastifyPluginAsync = async (fastify) => {
       throw new Error("Database repositories failed to initialize.");
     }
 
-    // Close connection when Fastify closes
     fastify.addHook("onClose", async () => {
       if (dataSource.isInitialized) {
         await dataSource.destroy();
@@ -92,7 +91,7 @@ const typeormPlugin: FastifyPluginAsync = async (fastify) => {
     });
   } catch (err) {
     logger.error(`Error during TypeORM Data Source initialization: ${err}`);
-    throw err; // prevent server from starting without DB
+    throw err;
   }
 };
 

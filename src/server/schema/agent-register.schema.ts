@@ -1,14 +1,3 @@
-// Schemas for POST /agent/register?token=<verify-jwt>.
-//
-// The user + person already exist (created via POST /user + email verification).
-// Authorization is the verify token carried in the querystring (see the route's
-// preHandler); the body only describes the agent action: JOIN an existing agent
-// by id, or CREATE a new one.
-//
-// NOTE: the create field names (`info`, `languages: number[]`) follow the
-// registration write contract (SDK ApiAgentRegisterNew) and intentionally
-// differ from the agent PATCH shape (`about`, `languages: OptionById[]`).
-
 export const registerAgentQuerySchema = {
   type: "object",
   required: ["token"],
@@ -18,7 +7,6 @@ export const registerAgentQuerySchema = {
   },
 };
 
-// GET /agent/register/search?token=&street= — picker lookup during registration.
 export const registerSearchQuerySchema = {
   type: "object",
   required: ["token"],
@@ -38,7 +26,7 @@ export const registerSearchResponseSchema = {
       type: "array",
       items: {
         type: "object",
-        required: ["id", "title"],
+        required: ["id"],
         additionalProperties: false,
         properties: {
           id: { type: "integer", minimum: 1 },
@@ -49,14 +37,6 @@ export const registerSearchResponseSchema = {
   },
 };
 
-// Fields shared by both create flows: self-registration's CREATE branch
-// (which also collects `phone`, written onto the registrant's own Person)
-// and the coordinator/admin bare-create below (which has no Person to
-// attach a phone to).
-//
-// No `districtId`: district is derived from addressPostcode, never
-// client-settable (be#1059, mirroring parseAgentPatch / be#827). AJV's
-// `removeAdditional` strips it if an older client still sends it.
 const agentCreateBaseSchema = {
   type: "object",
   required: ["title"],
@@ -76,6 +56,8 @@ const agentCreateBaseSchema = {
       type: "array",
       items: { type: "integer", minimum: 1 },
     },
+    confirmSharedAddress: { type: "boolean" },
+    organizationId: { type: "integer", minimum: 1 },
   },
 };
 
@@ -124,23 +106,58 @@ export const registerAgentResponseSchema = {
   },
 };
 
-// 409 on CREATE when the title is taken (`title`) or the street+postcode
-// already resolve to an existing agent (`address`) — carries that agent's id so
-// the client can offer to JOIN instead. Overrides the generic 409.
+const conflictBase = {
+  message: { type: "string" },
+  agentId: { type: "integer", minimum: 1 },
+};
+
 export const registerAgentConflictSchema = {
+  anyOf: [
+    {
+      type: "object",
+      required: ["message", "conflict"],
+      properties: { ...conflictBase, conflict: { const: "title" } },
+    },
+    {
+      type: "object",
+      required: ["message", "conflict", "agentId"],
+      properties: {
+        ...conflictBase,
+        conflict: { const: "address" },
+        agentTitle: { type: "string" },
+      },
+    },
+    {
+      type: "object",
+      required: ["message", "conflict", "agentId", "membershipStatus"],
+      properties: {
+        ...conflictBase,
+        conflict: { const: "registered" },
+        membershipStatus: { type: "string", enum: ["active", "pending"] },
+      },
+    },
+  ],
+};
+
+export const registerAgentStatusResponseSchema = {
   type: "object",
-  required: ["message", "conflict"],
+  required: ["message", "data"],
   properties: {
     message: { type: "string" },
-    conflict: { type: "string", enum: ["title", "address"] },
-    agentId: { type: "integer", minimum: 1 },
+    data: {
+      type: "object",
+      required: ["registered"],
+      additionalProperties: false,
+      properties: {
+        registered: { type: "boolean" },
+        agentId: { type: "integer", minimum: 1 },
+        agentTitle: { type: "string" },
+        membershipStatus: { type: "string", enum: ["active", "pending"] },
+      },
+    },
   },
 };
 
-// POST /agent (coordinator/admin-only, fe#911) — same create fields as
-// registration's CREATE branch, minus `phone` (a bare agent has no linked
-// Person to attach it to — see createBareAgent). The body isn't wrapped in
-// { agent: ... } since this endpoint only ever creates, never joins.
 export const createAgentBodySchema = agentCreateBaseSchema;
 
 export const createAgentResponseSchema = {

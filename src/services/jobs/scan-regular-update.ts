@@ -1,14 +1,13 @@
 import { FastifyInstance } from "fastify";
 import { OpportunityStatusType, OpportunityType } from "need4deed-sdk";
 import { And, In, LessThan, MoreThanOrEqual } from "typeorm";
-import { crossedMonthsAgo } from "./german-holidays";
+import { crossedMonthsAgo } from "./berlin-dates";
 import { reportCronFailure } from "./report-cron-failure";
 
 export async function scanRegularUpdate(
   fastify: FastifyInstance,
   now: Date = new Date(),
 ): Promise<void> {
-  // Rows that reached 2 months without an update since yesterday's run.
   const { from, to } = crossedMonthsAgo(2, now);
 
   const opps = await fastify.db.opportunityRepository.find({
@@ -24,8 +23,6 @@ export async function scanRegularUpdate(
     relations: ["contactPerson", "contactPerson.users"],
   });
 
-  // Posted to Slack for coordinators (be#1088): nothing is recorded in
-  // Communication, the daily window keeps each opportunity to one post.
   for (const opp of opps) {
     try {
       await fastify.cronNotify.emailRegularUpdate(opp);

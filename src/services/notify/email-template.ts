@@ -1,10 +1,12 @@
 import { Lang } from "need4deed-sdk";
 import {
   emailTemplateFetchTimeoutMs,
+  emailTemplateRetryMs,
   emailTemplateTtlMs,
 } from "../../config/constants";
-import { fetchJsonFromUrl } from "../../data/utils";
+import { fetchFileFromUrl, fetchJsonFromUrl } from "../../data/utils";
 import logger from "../../logger";
+import { withErrorCodes } from "../utils";
 
 export interface LocaleContent {
   subject: string;
@@ -12,25 +14,12 @@ export interface LocaleContent {
   text?: string;
 }
 
-// A manifest is either per-locale content keyed by "en"/"de", or a single flat
-// LocaleContent used as-is regardless of locale (for content that isn't split
-// by language, e.g. a template that already mixes both languages in one body).
 export type Manifest = Partial<Record<Lang, LocaleContent>> | LocaleContent;
-// A translatable value, one string per language — see fillTemplate() for how
-// a placeholder picks the right one.
 export type LocalizedValue = Record<Lang, string>;
-// null/undefined are legal values here (not just string | number) precisely
-// because that's the failure mode fillTemplate() guards against — a caller
-// computing a var that unexpectedly comes back nullish.
 export type TemplateVar = string | number | LocalizedValue | null | undefined;
 export type TemplateVars = Record<string, TemplateVar>;
 
-// Berlin-based NGO — when a recipient's locale can't be determined (e.g. a
-// volunteer with no User row to read a language preference from), German is
-// the more appropriate default than English.
 const DEFAULT_LOCALE = Lang.DE;
-// {{ key }}, or {{ key.en }} / {{ key.de }} to pick one language of a
-// LocalizedValue explicitly.
 const PLACEHOLDER_RE = /\{\{\s*(\w+)(?:\.(\w+))?\s*\}\}/g;
 
 function isLocalizedValue(value: TemplateVar): value is LocalizedValue {
@@ -55,9 +44,95 @@ export function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]);
 }
 
-// Shared by fillTemplate() and renderEmail(): also reports the placeholders
-// that point at a LocalizedValue but can't tell which language to use, so
-// renderEmail() can fall back to the builtin instead of sending them.
+const SLOT_MARK = String.fromCharCode(0xe000);
+const EMAIL_NOTE_SLOT = `${SLOT_MARK}emailNote${SLOT_MARK}`;
+
+const PARAGRAPH_BREAK_RE = /\r?\n[ \t]*\r?\n/g;
+const HTML_PARAGRAPH_RE = /<p[\s>]/gi;
+const HTML_BODY_END_RE = /<\/body\s*>/gi;
+const TEXT_SLOT_RE = new RegExp(
+  `[^\\r\\n]*${EMAIL_NOTE_SLOT}[^\\r\\n]*(?:\\r?\\n[ \\t]*\\r?\\n|\\r?\\n|$)`,
+  "g",
+);
+const HTML_SLOT_RE = new RegExp(
+  `<(p|div|li|span)\\b[^>]*>[^<]*${EMAIL_NOTE_SLOT}[^<]*</\\1\\s*>`,
+  "gi",
+);
+const EMAIL_NOTE_VAR = Object.fromEntries(
+  Object.values(Lang).map((lang) => [lang, EMAIL_NOTE_SLOT]),
+) as LocalizedValue;
+
+function lastIndexOf(source: string, re: RegExp): number | undefined {
+  return [...source.matchAll(re)].at(-1)?.index;
+}
+
+function insertBeforeLastParagraph(text: string, paragraph: string): string {
+  const eol = text.includes("\r\n") ? "\r\n" : "\n";
+  const body = text.trimEnd();
+  const tail = text.slice(body.length);
+  const lastBreak = [...body.matchAll(PARAGRAPH_BREAK_RE)].at(-1);
+  if (lastBreak?.index === undefined) {
+    return `${body}${eol}${eol}${paragraph}${tail}`;
+  }
+  const [separator] = lastBreak;
+  return (
+    body.slice(0, lastBreak.index) +
+    separator +
+    paragraph +
+    separator +
+    body.slice(lastBreak.index + separator.length) +
+    tail
+  );
+}
+
+function insertBeforeLastHtmlParagraph(
+  html: string,
+  paragraph: string,
+): string {
+  const at =
+    lastIndexOf(html, HTML_PARAGRAPH_RE) ?? lastIndexOf(html, HTML_BODY_END_RE);
+  return at === undefined
+    ? `${html}${paragraph}`
+    : html.slice(0, at) + paragraph + html.slice(at);
+}
+
+function withTextNote(text: string, note: string): string {
+  const paragraph = note.replace(/\n/g, text.includes("\r\n") ? "\r\n" : "\n");
+  if (text.includes(EMAIL_NOTE_SLOT)) {
+    return note
+      ? text.replaceAll(EMAIL_NOTE_SLOT, () => paragraph)
+      : text.replace(TEXT_SLOT_RE, "");
+  }
+  return note ? insertBeforeLastParagraph(text, paragraph) : text;
+}
+
+function withHtmlNote(html: string, note: string): string {
+  const escaped = escapeHtml(note).replace(/\n/g, "<br>");
+  if (html.includes(EMAIL_NOTE_SLOT)) {
+    return note
+      ? html.replaceAll(EMAIL_NOTE_SLOT, () => escaped)
+      : html.replace(HTML_SLOT_RE, "").replaceAll(EMAIL_NOTE_SLOT, "");
+  }
+  return note ? insertBeforeLastHtmlParagraph(html, `<p>${escaped}</p>`) : html;
+}
+
+export function withEmailNote(
+  result: FillResult,
+  emailNote: string | undefined,
+): FillResult {
+  const note = emailNote?.replace(/\r\n?/g, "\n").trim() ?? "";
+  return {
+    ...result,
+    subject: result.subject.replaceAll(EMAIL_NOTE_SLOT, ""),
+    ...(result.text !== undefined
+      ? { text: withTextNote(result.text, note) }
+      : {}),
+    ...(result.html !== undefined
+      ? { html: withHtmlNote(result.html, note) }
+      : {}),
+  };
+}
+
 function fill(
   content: LocaleContent,
   vars: TemplateVars,
@@ -71,13 +146,14 @@ function fill(
       let resolved: string | number | null | undefined;
       if (isLocalizedValue(value)) {
         const pick = lang ?? locale;
-        if (pick === undefined) {
+        const [first, ...rest] = Object.values(value);
+        if (pick === undefined && rest.some((v) => v !== first)) {
           ambiguous.push(key);
           return match;
         }
-        resolved = isLang(pick) ? value[pick] : undefined;
+        resolved =
+          pick === undefined ? first : isLang(pick) ? value[pick] : undefined;
       } else {
-        // {{ key.en }} on a plain value is a template/caller mismatch.
         resolved = lang === undefined ? value : undefined;
       }
       if (resolved === undefined || resolved === null) {
@@ -99,23 +175,6 @@ function fill(
   };
 }
 
-/**
- * Replace all {{ key }} placeholders in the template content with values
- * from vars. Handles optional whitespace around keys. Every placeholder must
- * resolve to a real value — a key genuinely absent from vars, or present but
- * null/undefined, is left unresolved (the `{{ ... }}` stays in the output)
- * and warned about, so a template/caller mismatch always surfaces rather
- * than silently rendering blank.
- *
- * A LocalizedValue var resolves by `{{ key.en }}` / `{{ key.de }}`, or by a
- * plain `{{ key }}` when `locale` (the language of the content) is given.
- * A plain `{{ key }}` with no `locale` can't pick a language and stays
- * unresolved — use renderEmail() to fall back to the builtin instead.
- *
- * Never substring-matches rendered text for "undefined"/etc. — a user could
- * legitimately type that into free-text content (a title, a comment), and
- * that must never be flagged as invalid.
- */
 export function fillTemplate(
   content: LocaleContent,
   vars: TemplateVars,
@@ -128,40 +187,40 @@ export function fillTemplate(
   return result;
 }
 
-export function resolveLocale(language: string | undefined): Lang {
+export function resolveLocale(
+  language: string | undefined,
+  fallback: Lang = DEFAULT_LOCALE,
+): Lang {
   return language === Lang.DE
     ? Lang.DE
     : language === Lang.EN
       ? Lang.EN
-      : DEFAULT_LOCALE;
+      : fallback;
 }
 
 function isValid(content: LocaleContent | undefined): content is LocaleContent {
   return Boolean(content?.subject && (content.html || content.text));
 }
 
-// A flat manifest has a top-level "subject" — the per-locale shape never does,
-// since its top-level keys are always locale codes ("en"/"de").
 function isFlatContent(manifest: Manifest): manifest is LocaleContent {
   return typeof (manifest as LocaleContent).subject === "string";
 }
 
-// resolveContent()'s pick, plus the language of the picked content —
-// undefined for flat content, which has no single language.
 function pickContent(
   manifest: Manifest | null,
   locale: Lang,
   builtin: Record<Lang, LocaleContent>,
+  fallback: Lang = DEFAULT_LOCALE,
 ): { content: LocaleContent; lang?: Lang } {
   const fromBuiltin = (): { content: LocaleContent; lang: Lang } =>
     builtin[locale]
       ? { content: builtin[locale], lang: locale }
-      : { content: builtin[DEFAULT_LOCALE], lang: DEFAULT_LOCALE };
+      : { content: builtin[fallback], lang: fallback };
 
   if (manifest && isFlatContent(manifest)) {
     return isValid(manifest) ? { content: manifest } : fromBuiltin();
   }
-  for (const lang of [locale, DEFAULT_LOCALE]) {
+  for (const lang of [locale, fallback]) {
     const content = manifest?.[lang];
     if (isValid(content)) {
       return { content, lang };
@@ -178,12 +237,6 @@ export function resolveContent(
   return pickContent(manifest, locale, builtin).content;
 }
 
-/**
- * Like resolveContent(), but for templates that were never split by
- * recipient locale in the first place — the manifest (or its fallback) is a
- * single flat LocaleContent used as-is, regardless of who's receiving it.
- * No locale to resolve, so there's nothing to guess wrong.
- */
 export function resolveFlatContent(
   manifest: Manifest | null,
   builtin: LocaleContent,
@@ -199,34 +252,24 @@ function isFlatBuiltin(
   return typeof (builtin as LocaleContent).subject === "string";
 }
 
-/**
- * Pick the content (as resolveContent()/resolveFlatContent() do, by the
- * builtin's shape) and fill it. Each LocalizedValue resolves in the language
- * of the content it lands in: the locale of a per-locale entry, or the
- * explicit `{{ key.en }}` / `{{ key.de }}` in a flat bilingual body.
- *
- * A manifest that leaves the language of a LocalizedValue open (a plain
- * `{{ key }}` in a flat body) is treated like an invalid manifest: the
- * builtin is rendered instead, which is kept correct in code.
- *
- * `escapeHtmlValues`: HTML-escape every value substituted into the html
- * body — for emails carrying user-entered text (e.g. a tag's comment).
- */
 export function renderEmail(
   manifest: Manifest | null,
   builtin: LocaleContent | Record<Lang, LocaleContent>,
   vars: TemplateVars,
   locale: Lang = DEFAULT_LOCALE,
-  { escapeHtmlValues = false }: { escapeHtmlValues?: boolean } = {},
+  {
+    escapeHtmlValues = false,
+    fallbackLocale = DEFAULT_LOCALE,
+  }: { escapeHtmlValues?: boolean; fallbackLocale?: Lang } = {},
 ): FillResult {
   const pickBuiltin = (): { content: LocaleContent; lang?: Lang } =>
     isFlatBuiltin(builtin)
       ? { content: builtin }
-      : pickContent(null, locale, builtin);
+      : pickContent(null, locale, builtin, fallbackLocale);
 
   const picked = isFlatBuiltin(builtin)
     ? { content: resolveFlatContent(manifest, builtin) }
-    : pickContent(manifest, locale, builtin);
+    : pickContent(manifest, locale, builtin, fallbackLocale);
 
   const { result, ambiguous } = fill(
     picked.content,
@@ -240,8 +283,6 @@ export function renderEmail(
 
   const fallback = pickBuiltin();
   if (fallback.content === picked.content) {
-    // The builtin itself is ambiguous — leave the placeholders unresolved so
-    // ValidatingEmailTransport suspends the send and reports it.
     logger.warn(
       `email builtin: no language for placeholder(s) ${formatKeys(ambiguous)}`,
     );
@@ -268,6 +309,18 @@ export function renderEmail(
   return fromBuiltin.result;
 }
 
+export function renderEmailWithNote(
+  manifest: Manifest | null,
+  builtin: LocaleContent | Record<Lang, LocaleContent>,
+  vars: TemplateVars,
+  emailNote: string | undefined,
+): FillResult {
+  return withEmailNote(
+    renderEmail(manifest, builtin, { ...vars, emailNote: EMAIL_NOTE_VAR }),
+    emailNote,
+  );
+}
+
 function formatKeys(keys: string[]): string {
   return keys.map((k) => `{{${k}}}`).join(", ");
 }
@@ -284,39 +337,87 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   }
 }
 
-/**
- * Returns a cached CDN manifest loader bound to a specific URL. Each email
- * type creates its own loader; they share the same TTL/timeout config but keep
- * separate caches. resetCache() is exposed for test isolation.
- */
-export function createManifestLoader(url: string): {
-  load(): Promise<Manifest | null>;
-  resetCache(): void;
-} {
-  let cache: { value: Manifest; expires: number } | null = null;
+function createCachedLoader<T>(
+  label: string,
+  url: string,
+  fetchValue: () => Promise<T>,
+  onColdFailure: (err: unknown) => T,
+): { load(): Promise<T>; resetCache(): void } {
+  let cache: { value: T; expires: number } | null = null;
 
   return {
     resetCache() {
       cache = null;
     },
-    async load(): Promise<Manifest | null> {
+    async load(): Promise<T> {
       const now = Date.now();
       if (cache && now < cache.expires) {
         return cache.value;
       }
       try {
-        const value = (await withTimeout(
-          fetchJsonFromUrl(url),
-          emailTemplateFetchTimeoutMs,
-        )) as Manifest;
+        const value = await fetchValue();
         cache = { value, expires: now + emailTemplateTtlMs };
         return value;
       } catch (err) {
         logger.warn(
-          `email manifest fetch failed (${url}): ${err instanceof Error ? err.message : err}`,
+          withErrorCodes(
+            `email ${label} fetch failed (${url}): ${err instanceof Error ? err.message : err}`,
+            err,
+          ),
         );
-        return cache?.value ?? null;
+        const value = cache ? cache.value : onColdFailure(err);
+        cache = { value, expires: now + emailTemplateRetryMs };
+        return value;
       }
     },
   };
+}
+
+export function createManifestLoader(url: string): {
+  load(): Promise<Manifest | null>;
+  resetCache(): void;
+} {
+  return createCachedLoader<Manifest | null>(
+    "manifest",
+    url,
+    async () =>
+      (await withTimeout(
+        fetchJsonFromUrl(url),
+        emailTemplateFetchTimeoutMs,
+      )) as Manifest,
+    () => null,
+  );
+}
+
+export class AttachmentUnavailableError extends Error {
+  constructor(url: string, cause: unknown) {
+    super(
+      `attachment unavailable (${url}): ${cause instanceof Error ? cause.message : cause}`,
+      { cause },
+    );
+    this.name = "AttachmentUnavailableError";
+  }
+}
+
+export function createFileLoader(
+  url: string,
+  isValidFile: (file: Buffer) => boolean = () => true,
+): {
+  load(): Promise<Buffer>;
+  resetCache(): void;
+} {
+  return createCachedLoader(
+    "attachment",
+    url,
+    async () => {
+      const file = await fetchFileFromUrl(url, emailTemplateFetchTimeoutMs);
+      if (!isValidFile(file)) {
+        throw new Error("unexpected file content");
+      }
+      return file;
+    },
+    (err) => {
+      throw new AttachmentUnavailableError(url, err);
+    },
+  );
 }

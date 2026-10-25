@@ -2,6 +2,7 @@ import {
   ApiPostListQuery,
   Lang,
   OpportunitySortField,
+  QueryParamsKeys,
   SortOrder,
   UserRole,
 } from "need4deed-sdk";
@@ -38,14 +39,22 @@ export interface QuerystringPaginationLanguage
   language: Lang;
 }
 
-// GET /event has neither pagination nor ordering, and language is optional
-// (defaults to Lang.DE) rather than required — QuerystringPaginationLanguage
-// doesn't fit.
 export interface QuerystringEventGetList {
+  language?: Lang;
+  search?: string;
+  from?: string;
+  to?: string;
+}
+
+export interface QuerystringEventGet {
   language?: Lang;
 }
 
-// TODO: what about arrays?
+export interface QuerystringCommuteFiltering {
+  [QueryParamsKeys.COMMUTE_POSTCODE]?: string;
+  [QueryParamsKeys.MAX_COMMUTE_MINUTES]?: number;
+}
+
 export interface QuerystringOpportunityFiltering {
   filter?: {
     type: string;
@@ -53,27 +62,23 @@ export interface QuerystringOpportunityFiltering {
     agentId?: number;
     search?: string;
     language?: string;
-    german?: boolean;
     activity?: string;
     skill?: string;
-    availability?: string;
+    availability?: string | string[];
     district?: string;
-  };
+  } & QuerystringCommuteFiltering;
 }
 
 export type QuerystringOpportunityGetList = QuerystringPaginationLanguage &
   QuerystringOpportunityFiltering;
 
 export type QuerystringVolunteerOpportunityGetList =
-  QuerystringPaginationLanguage & QuerystringOpportunityFiltering;
+  QuerystringPaginationLanguage &
+    NonNullable<QuerystringOpportunityFiltering["filter"]>;
 
 export type QuerystringOpportunityList = QuerystringPaginationLanguage &
   QuerystringOpportunityFiltering & {
-    // Which field `sortOrder` applies to. Scoped to the opportunity list
-    // only (not the shared QuerystringPaginationOrdering) — sorting by
-    // start date only makes sense here, not for agent/volunteer/user lists.
     sortBy?: OpportunitySortField;
-    // Calendar view (be#889): filter by Opportunity.onetimer.date range.
     appointmentDateFrom?: string;
     appointmentDateTo?: string;
     hasAppointmentDate?: boolean;
@@ -102,11 +107,12 @@ export interface QuerystringVolunteerFiltering {
     language?: string | string[];
     activity?: string | string[];
     skill?: string | string[];
-    availability?: string;
+    availability?: string | string[];
     district?: string | string[];
     engagement?: string | string[];
     match?: string | string[];
-  };
+    ownerAgent?: string | string[];
+  } & QuerystringCommuteFiltering;
 }
 export type VolunteerListType = "card" | "table";
 
@@ -119,9 +125,4 @@ export interface QuerystringUserList extends QuerystringPagination {
   role?: UserRole;
 }
 
-// Aliases the SDK contract type directly rather than a hand-maintained
-// interface (per shared-rules.md: never duplicate SDK types) — but that
-// means postListQuerySchema (querystring.ts) isn't derived from this type
-// and can silently drift from it on a future SDK bump; keep them in sync by
-// hand (see the comment on postListQuerySchema).
 export type QuerystringPostList = ApiPostListQuery;

@@ -1,10 +1,10 @@
 import { FastifyInstance, FastifyPluginOptions, FastifyRequest } from "fastify";
 import {
-  AgentMembershipStatus,
   ApiAgentCreateResponse,
   ApiAgentGetList,
   ApiAgentPatch,
   ApiAgentRegisterNew,
+  ApiAgentTagCandidate,
   SortOrder,
   UserRole,
 } from "need4deed-sdk";
@@ -44,18 +44,28 @@ import {
 import {
   addAgentTypeServiceTranslations,
   addComments2Entity,
+  assertAgentMemberOrStaffOr403,
   assertAgentVisible,
+  assertRoleIn,
   createAddress,
   getAgentWhere,
   getDistrictToAgentHandler,
   getSkipTake,
+  isStaffRole,
   patchAddress,
   syncAgentDistrictFromPostcode,
   updateAgentLanguages,
   updateAgentServices,
+  updateBackfilledColumn,
 } from "../../utils";
+import { getAgentTagCandidates } from "../../utils/data/get-agent-tag-candidates";
+import { canTagAgents } from "../../utils/data/tag-agents";
 import { createAgent } from "../../utils/data/write-agent-registration";
-import { maskForCaller } from "../../utils/pii/pre-serialization";
+import { maskPii } from "../../utils/pii/mask";
+import {
+  maskForCaller,
+  resolveCallerMask,
+} from "../../utils/pii/pre-serialization";
 import agentCommunicationRoutes from "./agent-communication.routes";
 import agentOpportunityRoutes from "./agent-opportunity.routes";
 import agentVolunteerRoutes from "./agent-volunteer.routes";
@@ -63,12 +73,6 @@ import agentContactRoutes from "./contact.routes";
 import agentMembershipRoutes from "./membership.routes";
 import agentRegisterRoutes from "./register.routes";
 
-// A VOLUNTEER has no business on any /agent route (be#1039): an opportunity's
-// `agentId` would otherwise let them look up the RAC they aren't matched to
-// (operator, website, about, org email, or confirm its name via
-// `filter[search]`), bypassing the RAC masking on /opportunity. Their RAC,
-// once matched, comes with the opportunity itself. Public (token-gated)
-// registration routes are left to their own auth.
 async function denyVolunteer(request: FastifyRequest): Promise<void> {
   const config = request.routeOptions.config as { public?: boolean };
   if (
@@ -79,56 +83,10 @@ async function denyVolunteer(request: FastifyRequest): Promise<void> {
   }
 }
 
-// Mirrors the role allowlist in contact.routes.ts: only these three roles may
-// reach the membership check. Cheap (no DB), so it runs before the
-// agent-existence check.
-function assertHasOrgEditRole(request: FastifyRequest): void {
-  const role = request.authUser?.role;
-  if (
-    role !== UserRole.COORDINATOR &&
-    role !== UserRole.AGENT &&
-    role !== UserRole.ADMIN
-  ) {
-    throw new UnauthorizedError();
-  }
-}
-
-// Coordinator/admin may edit any agent; an AGENT must be an active member of
-// this specific agent. Run this *after* the 404 check for the agent itself,
-// so a non-member probing a nonexistent agent id still gets 404 rather than
-// a 403 that changes already-established error-code semantics.
-async function assertCanEditOrg(
-  fastify: FastifyInstance,
-  request: FastifyRequest,
-  agentId: number,
-): Promise<void> {
-  const role = request.authUser?.role;
-  if (role === UserRole.COORDINATOR || role === UserRole.ADMIN) {
-    return;
-  }
-
-  const personId = request.authUser?.personId;
-  const membership = personId
-    ? await fastify.db.agentPersonRepository.findOneBy({
-        agentId,
-        personId,
-        status: AgentMembershipStatus.ACTIVE,
-      })
-    : null;
-  if (!membership) {
-    throw new UnauthorizedError(
-      "Only active members of this agent can edit its organization details.",
-    );
-  }
-}
-
 export default async function agentRoutes(
   fastify: FastifyInstance,
   _options: FastifyPluginOptions,
 ) {
-  // GETs are open to any logged-in user but a VOLUNTEER (PII is masked per
-  // role in the preSerialization hooks below); writes are re-gated per-route: DELETE
-  // stays COORDINATOR-only, PATCH also allows an active AgentPerson member.
   fastify.addHook("onRequest", fastify.authenticate());
   fastify.addHook("onRequest", denyVolunteer);
 
@@ -167,15 +125,11 @@ export default async function agentRoutes(
       logger.debug(`GET /agent: request.query:${Object.keys(request.query)}`);
       const { page, limit, sortOrder, filter } = request.query;
       const [skip, take] = getSkipTake({ page, limit });
-      const where = await getAgentWhere(filter);
+      const visibility = await resolveCallerMask(request);
+      const where = await getAgentWhere(filter, visibility);
 
-      // A coordinator-created agent (fe#911) stays `unclaimed` until a real
-      // registration claims it — keep it out of the list for anyone but
-      // coordinator/admin. Filtered in the query itself (not in-memory after
-      // the page is fetched) so `count` and the returned page stay consistent.
       const role = request.authUser?.role;
-      const isPrivileged =
-        role === UserRole.COORDINATOR || role === UserRole.ADMIN;
+      const isPrivileged = isStaffRole(role);
       if (!isPrivileged) {
         where.unclaimed = false;
       }
@@ -207,19 +161,12 @@ export default async function agentRoutes(
       const agentsDistrict = await Promise.all(agents.map(addDistrictToAgent));
       await addAgentTypeServiceTranslations(agentsDistrict);
 
-      if (updates.length > 0) {
-        await agentRepository.save(updates);
+      await updateBackfilledColumn(agentRepository, updates, "districtId");
+
+      if (visibility) {
+        maskPii(agentsDistrict, visibility);
       }
 
-      // dtoAgentGetList takes a handler-computed district-centroid arg
-      // (be#1083), so mask inline (rather than via the makePiiSerialization
-      // hook) before serializing — masking first means a caller without
-      // visibility into an agent gets its district centroid, never its own
-      // (nulled) postcode coordinates.
-      await maskForCaller(request, agentsDistrict);
-
-      // Map-pin centroid fallback, batched for just the agents that aren't
-      // geocoded — see GET /opportunity for why this isn't an eager relation.
       const neededDistrictIds = new Map(
         agentsDistrict.map((agent) => [
           agent.id,
@@ -252,10 +199,6 @@ export default async function agentRoutes(
     },
   );
 
-  // POST / — coordinator/admin creates a bare Agent with no linked Person/User
-  // (fe#911), for an NGO the coordinator already has details for before it has
-  // self-registered. Distinct from POST /agent/register, which always links
-  // the authenticated caller's own person.
   fastify.post<{
     Body: ApiAgentRegisterNew;
     Reply: ReplyData<ApiAgentCreateResponse>;
@@ -278,6 +221,30 @@ export default async function agentRoutes(
         message: "Agent created successfully.",
         data: result,
       });
+    },
+  );
+
+  fastify.get<{
+    Querystring: { search?: string };
+    Reply: ReplyData<ApiAgentTagCandidate[]>;
+  }>(
+    "/tag-candidates",
+    {
+      schema: {
+        querystring: {
+          type: "object",
+          properties: { search: { type: "string", maxLength: 100 } },
+          additionalProperties: false,
+        },
+        response: responseSchema("ApiAgentTagCandidate#", true, false),
+      },
+    },
+    async (request, reply) => {
+      if (!canTagAgents(request.authUser?.role)) {
+        throw new UnauthorizedError();
+      }
+      const data = await getAgentTagCandidates(request, request.query.search);
+      return reply.status(200).send({ message: "Tag candidates.", data });
     },
   );
 
@@ -318,13 +285,8 @@ export default async function agentRoutes(
       const agentComments = await addComments2Entity(agentDistrict);
       await addAgentTypeServiceTranslations([agentComments]);
 
-      if (updates.length > 0) {
-        await agentRepository.save(updates);
-      }
+      await updateBackfilledColumn(agentRepository, updates, "districtId");
 
-      // dtoAgentGet takes a handler-computed district-centroid arg (be#1083),
-      // so mask inline (rather than via the makePiiSerialization hook) before
-      // serializing, same as GET /agent above.
       await maskForCaller(request, agentComments);
 
       const districtIdNeedingCentroid =
@@ -355,7 +317,7 @@ export default async function agentRoutes(
       const { id } = request.params;
       logger.debug(`PATCH /agent/${id}, fields:${Object.keys(request.body)}`);
 
-      assertHasOrgEditRole(request);
+      assertRoleIn(request);
 
       const agentRepository = fastify.db.agentRepository;
       const agent = await agentRepository.findOneBy({ id });
@@ -364,13 +326,15 @@ export default async function agentRoutes(
         throw new NotFoundError(`Agent (id:${id}) not found.`);
       }
 
-      await assertCanEditOrg(fastify, request, id);
+      await assertAgentMemberOrStaffOr403(
+        request,
+        id,
+        "Only active members of this agent can edit its organization details.",
+      );
 
       const { addressStreet, addressPostcode, languages, serviceIds } =
         request.body;
 
-      // Persist address, scalar fields and languages atomically so a partial
-      // failure can't leave the agent half-updated.
       await agentRepository.manager.transaction(async (manager) => {
         if (addressStreet || addressPostcode) {
           const addressData = addressStreet ? { street: addressStreet } : {};
@@ -406,12 +370,6 @@ export default async function agentRoutes(
 
         Object.assign(agent, parseAgentPatch(request.body));
 
-        // District is derived from postcode, never independently settable
-        // (be#827) — recompute it here, after any address/postcode update
-        // above, so it can't drift out of sync. Runs on every patch, not
-        // only ones that touch the address, so a stale district left over
-        // from before this fix also gets corrected the next time this
-        // agent is edited at all.
         if (agent.addressId) {
           const addressRepository = getRepository(manager, Address);
           const address = await addressRepository.findOne({

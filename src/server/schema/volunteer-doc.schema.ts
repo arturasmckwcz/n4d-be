@@ -1,3 +1,5 @@
+import { ApplicationEmailFailureReason } from "need4deed-sdk";
+
 export const volunteerDocSchemaGet200 = {
   type: "object",
   properties: {
@@ -27,7 +29,6 @@ export const volunteerDocSchemaGetMeta200 = {
         "x-amz-meta-mime-type": { type: "string" },
         "x-amz-meta-s3-key": { type: "string" },
       },
-      // required: [],
     },
   },
   required: ["url", "fields"],
@@ -41,4 +42,34 @@ export const volunteerDocSchemaUploadMeta = {
     type: { $ref: "DocumentType#" },
   },
   required: ["mimeType", "originalName", "type"],
+};
+
+export const volunteerDocSchemaApplicationEmail201 = {
+  type: "object",
+  properties: {
+    message: { type: "string" },
+    data: {
+      type: "object",
+      properties: { sentAt: { type: "string", format: "date-time" } },
+      required: ["sentAt"],
+    },
+  },
+  required: ["message", "data"],
+};
+
+const applicationEmailFailureReasons = Object.keys({
+  "attachment-unavailable": true,
+  "email-invalid": true,
+  "render-failed": true,
+  "send-failed": true,
+} satisfies Record<ApplicationEmailFailureReason, true>);
+
+export const volunteerDocSchemaApplicationEmail502 = {
+  type: "object",
+  properties: {
+    error: { type: "string" },
+    message: { type: "string" },
+    reason: { type: "string", enum: applicationEmailFailureReasons },
+  },
+  required: ["error", "message", "reason"],
 };

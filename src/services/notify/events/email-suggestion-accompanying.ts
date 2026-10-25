@@ -6,7 +6,8 @@ import {
 import OpportunityVolunteer from "../../../data/entity/m2m/opportunity-volunteer";
 import { formatOnetimerDate, formatOnetimerTime } from "../../dto/utils";
 import { SUGGESTION_ACCOMPANYING_BUILTIN as BUILTIN } from "../builtin-content";
-import { createManifestLoader, renderEmail } from "../email-template";
+import { createManifestLoader, renderEmailWithNote } from "../email-template";
+import { localizedOpportunityTitle } from "../opportunity-title";
 import { resolveAccompaniedPersonLanguage } from "../resolve-accompanied-person-language";
 import type { EmailTransport } from "../types";
 
@@ -16,18 +17,11 @@ export function resetSuggestionAccompanyingTemplateCache(): void {
   loader.resetCache();
 }
 
-// Counterpart to sendEmailSuggestion for ACCOMPANYING opportunities. Unlike a
-// regular opportunity's recurring dealTimeslot, an accompanying opportunity
-// has a single confirmed appointment (Opportunity.onetimer.date) set at
-// creation — so this reads that instead of a schedule, same formatting
-// convention as email-new-accompanying.ts/email-accompany-match.ts.
 export async function sendEmailSuggestionAccompanying(
   email: EmailTransport,
   ov: OpportunityVolunteer,
-  // Bypasses dry-run redirection, same as ValidatingEmailTransport's
-  // errorTransport (be#847) — defaults to `email` for callers that don't
-  // care about that distinction (e.g. tests with a single mock transport).
   errorTransport: EmailTransport = email,
+  emailNote?: string,
 ): Promise<void> {
   const volunteerEmail = ov.volunteer?.person?.email;
   if (!volunteerEmail) {
@@ -40,9 +34,7 @@ export async function sendEmailSuggestionAccompanying(
   const opportunity = ov.opportunity;
   const accompanying = opportunity?.accompanying;
 
-  const appointmentTitle = opportunity?.title ?? "";
-  // Full street address, deliberately — volunteers need it to decide whether
-  // they can make the appointment (be#1092 had cut it to the district).
+  const appointmentTitle = await localizedOpportunityTitle(opportunity);
   const appointmentAddress = accompanying?.address ?? "";
   const appointmentPlz = accompanying?.postcode?.value ?? "";
   const appointmentDate = formatOnetimerDate(opportunity?.onetimer?.date);
@@ -54,21 +46,23 @@ export async function sendEmailSuggestionAccompanying(
     `sendEmailSuggestionAccompanying, ov ${ov.id}`,
   );
 
-  const { subject, text, html } = renderEmail(await loader.load(), BUILTIN, {
-    volunteerName,
-    appointmentTitle,
-    appointmentAddress,
-    appointmentPlz,
-    appointmentDate,
-    appointmentTime,
-    accompaniedpersonLanguage,
-  });
+  const { subject, text, html } = renderEmailWithNote(
+    await loader.load(),
+    BUILTIN,
+    {
+      volunteerName,
+      appointmentTitle,
+      appointmentAddress,
+      appointmentPlz,
+      appointmentDate,
+      appointmentTime,
+      accompaniedpersonLanguage,
+    },
+    emailNote,
+  );
 
   await email.send({
     to: volunteerEmail,
-    // Accompanying-specific reply address, not emailFromVolunteer — the
-    // template text tells the volunteer to reply to accompanying@, not
-    // volunteer@ (regular suggestions still use emailFromVolunteer).
     cc: emailFromAccompanying,
     from: emailFromNotify,
     subject,

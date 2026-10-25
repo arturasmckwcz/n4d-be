@@ -1,25 +1,24 @@
-import { OccasionalType } from "need4deed-sdk";
+import { ByDay, OccasionalType } from "need4deed-sdk";
+import { BadRequestError } from "../../config";
 import { dataSource } from "../../data/data-source";
 import DealTimeslot from "../../data/entity/m2m/deal-timeslot";
 import Timeslot from "../../data/entity/time/timeslot.entity";
-import { getRepository, getRRULE, getStartEnd } from "../../data/utils";
+import {
+  BY_DAY_CODES,
+  getRepository,
+  getRRULE,
+  getStartEnd,
+} from "../../data/utils";
 import logger from "../../logger";
 import { getTimeslot } from "../../server/utils";
+import { parseBerlinDatetime } from "./parser-accompanying-legacy";
 
-export const WEEKDAYS = [
+// index = ISO weekday (1 = Monday)
+export const WEEKDAYS: readonly ("" | ByDay)[] = [
   "",
-  "Monday",
-  "Tuesday",
-  "Wednesday",
-  "Thursday",
-  "Friday",
-  "Saturday",
-  "Sunday",
-] as const;
+  ...BY_DAY_CODES.map((code) => ByDay[code]),
+];
 
-// Shared by dealParserOpportunity (legacy) and dealParserOpportunityCreate
-// (dashboard): timeslot resolution doesn't depend on the title-vs-id split
-// between those two forms, so both use it as-is.
 export async function buildDealTimeslots(
   timeslots: [number, string][] | undefined | null,
   onetimeDateTime: string | undefined | null,
@@ -43,11 +42,14 @@ export async function buildDealTimeslots(
 
   if (onetimeDateTime) {
     const timeslotRepository = getRepository(dataSource, Timeslot);
-    const start = new Date(onetimeDateTime);
+    const start = parseBerlinDatetime(onetimeDateTime);
+    if (isNaN(start.getTime())) {
+      throw new BadRequestError("Invalid event date and time.");
+    }
     const info = `One-time event on ${onetimeDateTime}`;
     const timeslot = await getTimeslot({ start, info });
 
-    await timeslotRepository.save(timeslot); // TODO: check if id is undefined before saving
+    await timeslotRepository.save(timeslot);
     logger.debug(`Created one-time timeslot: ${JSON.stringify(timeslot)}`);
 
     dealTimeslot.push(new DealTimeslot({ timeslot }));

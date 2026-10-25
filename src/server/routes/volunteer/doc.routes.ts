@@ -1,30 +1,84 @@
 import { Readable } from "stream";
 import { FastifyInstance, FastifyPluginOptions } from "fastify";
-import { DocumentType, UserRole } from "need4deed-sdk";
-import { UnauthorizedError } from "../../../config";
+import {
+  ApiVolunteerApplicationEmailPost,
+  ApplicationEmailFailureReason,
+  CommunicationType,
+  DocumentType,
+  UserRole,
+} from "need4deed-sdk";
+import { Raw } from "typeorm";
+import {
+  BadRequestError,
+  cgcApplicationResendGuardMs,
+  ConflictError,
+  EmailNotSentError,
+  UnauthorizedError,
+} from "../../../config";
+import Communication from "../../../data/entity/communication.entity";
 import Document from "../../../data/entity/document.entity";
 import logger from "../../../logger";
-import { tryCatch } from "../../../services/utils";
+import {
+  AttachmentUnavailableError,
+  EmailSendError,
+  SuspendedEmailError,
+} from "../../../services/notify";
+import { errorName, errorSummary, tryCatch } from "../../../services/utils";
 import {
   idParamSchema,
   idTypeParamSchema,
   responseErrors,
+  volunteerDocSchemaApplicationEmail201,
+  volunteerDocSchemaApplicationEmail502,
   volunteerDocSchemaGet200,
   volunteerDocSchemaGetMeta200,
   volunteerDocSchemaUploadMeta,
 } from "../../schema";
-import { getVolunteerDocuments } from "../../utils";
+import {
+  getVolunteerDocuments,
+  isStaffRole,
+  runWithAdvisoryLock,
+} from "../../utils";
+import { logEmailCommunication } from "../../utils/data/log-email-communication";
+
+const CGC_APPLICATION_LOCK_NAMESPACE = "cgc-application-email";
+
+function applicationEmailNotSent(err: unknown): EmailNotSentError {
+  const notSent = (message: string, reason: ApplicationEmailFailureReason) =>
+    new EmailNotSentError(`Application email not sent: ${message}`, {
+      reason,
+    });
+  if (err instanceof AttachmentUnavailableError) {
+    return notSent("application form unavailable", "attachment-unavailable");
+  }
+  if (err instanceof SuspendedEmailError) {
+    return notSent(err.problems.join("; "), "email-invalid");
+  }
+  if (err instanceof EmailSendError) {
+    return notSent("mail server did not accept it", "send-failed");
+  }
+  return notSent("email could not be built", "render-failed");
+}
 
 export default async function volunteerDocRoutes(
   fastify: FastifyInstance,
   _options: FastifyPluginOptions,
 ) {
-  // Documents can't be PII-masked (they're files/metadata), so these GETs stay
-  // COORDINATOR-only for everyone else — the parent /volunteer hook was
-  // relaxed to logged-in for the masked GET work, which would otherwise
-  // expose them to any user. A VOLUNTEER may still list their own documents
-  // (be#965's fe#1001 follow-up) — masking exists to hide *other* people's
-  // PII, not the caller's own.
+  async function removeUnsentLog(comm: Communication): Promise<void> {
+    try {
+      await fastify.db.communicationRepository.remove(comm);
+    } catch (removeErr) {
+      logger.error(
+        `unsent application email still logged (communication ${comm.id}): ${errorName(removeErr)}`,
+      );
+      fastify.notify
+        .opsAlert(
+          `Application email to volunteer ${comm.volunteerId} was not sent, but communication ${comm.id} could not be removed — delete it by hand.`,
+        )
+        .catch((err) => logger.error(err));
+    }
+  }
+
   fastify.get<{ Params: { id: number } }>(
     "/",
     {
@@ -39,7 +93,7 @@ export default async function volunteerDocRoutes(
     async (request, reply) => {
       const id = request.params.id;
       const role = request.authUser?.role;
-      if (role !== UserRole.COORDINATOR && role !== UserRole.ADMIN) {
+      if (!isStaffRole(role)) {
         if (role !== UserRole.VOLUNTEER) {
           throw new UnauthorizedError();
         }
@@ -60,6 +114,95 @@ export default async function volunteerDocRoutes(
       return reply.send({
         message: `Documents for volunteer ${id}`,
         data: documents,
+      });
+    },
+  );
+
+  fastify.post<{ Params: { id: number } }>(
+    "/application-email",
+    {
+      onRequest: fastify.authenticate({ role: UserRole.COORDINATOR }),
+      schema: {
+        params: idParamSchema,
+        response: {
+          201: volunteerDocSchemaApplicationEmail201,
+          ...responseErrors,
+          502: volunteerDocSchemaApplicationEmail502,
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+      const coordinatorPersonId = request.authUser?.personId;
+      const [volunteer, coordinator] = await Promise.all([
+        fastify.db.volunteerRepository.findOneOrFail({
+          where: { id },
+          relations: ["person", "person.users"],
+        }),
+        coordinatorPersonId
+          ? fastify.db.personRepository.findOneBy({ id: coordinatorPersonId })
+          : null,
+      ]);
+      const volunteerEmail = volunteer.person?.email;
+      if (!volunteerEmail) {
+        throw new BadRequestError(`Volunteer ${id} has no email address`);
+      }
+      const latestUser = [...(volunteer.person.users ?? [])].sort(
+        (a, b) => b.createdAt.getTime() - a.createdAt.getTime(),
+      )[0];
+
+      let comm: Communication | undefined;
+      const acquired = await runWithAdvisoryLock(
+        async (manager) => {
+          const commRepo = manager.getRepository(Communication);
+          const justSent = await commRepo.existsBy({
+            volunteerId: id,
+            communicationType: CommunicationType.CGC_APPLICATION_EMAIL,
+            date: Raw(
+              (alias) =>
+                `${alias} > LOCALTIMESTAMP - make_interval(secs => :secs)`,
+              { secs: cgcApplicationResendGuardMs / 1000 },
+            ),
+          });
+          if (justSent) {
+            throw new ConflictError(
+              `Application email to volunteer ${id} is being sent or was just sent`,
+            );
+          }
+          comm = await logEmailCommunication(
+            commRepo,
+            CommunicationType.CGC_APPLICATION_EMAIL,
+            { volunteerId: id, userId: request.authUser?.id },
+          );
+        },
+        [CGC_APPLICATION_LOCK_NAMESPACE, id],
+      );
+      if (!acquired || !comm) {
+        throw new ConflictError(
+          `Application email to volunteer ${id} is already being sent`,
+        );
+      }
+
+      try {
+        await fastify.notify.emailCgcApplication({
+          volunteerEmail,
+          volunteerName: volunteer.person.name,
+          language: latestUser?.language,
+          coordinatorName: coordinator?.name,
+          coordinatorEmail: request.authUser?.email,
+        });
+      } catch (sendErr) {
+        logger.error(
+          `application email to volunteer ${id} not sent: ${errorSummary(sendErr)}`,
+        );
+        await removeUnsentLog(comm);
+        throw applicationEmailNotSent(sendErr);
+      }
+
+      const data: ApiVolunteerApplicationEmailPost = { sentAt: comm.date };
+      return reply.status(201).send({
+        message: `Application email sent to volunteer ${id}`,
+        data,
       });
     },
   );

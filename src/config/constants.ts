@@ -12,8 +12,6 @@ export const TRUTHY = new Set([
   "true",
 ]);
 
-// cdn.need4deed.org (the cdn-proxy on the k3s cluster) replaced the retired
-// AWS CloudFront distribution at the 2026-09-24 cutover.
 export const CDNBaseUrl =
   process.env.CDN_BASE_URL || "https://cdn.need4deed.org";
 
@@ -90,31 +88,23 @@ export const seedEventsFile = path.join(
   "nid-events.json",
 );
 
-export const urlEmailVerification =
-  process.env.URL_EMAIL_VERIFICATION ||
-  "https://app.need4deed.org/verify-email";
-
-export const urlPasswordReset =
-  process.env.URL_PASSWORD_RESET || "https://app.need4deed.org/reset-password";
-
-export const urlCoordinatorInvite =
-  process.env.URL_COORDINATOR_INVITE ||
-  "https://app.need4deed.org/register-with-invite";
-
-// The fe origin, for dashboard links in notify emails (be#1075). The bare
-// domain rather than app.need4deed.org, whose prefix may be reused — all
-// three domains are served by the same fe.
 export const urlApp = process.env.URL_APP || "https://need4deed.org";
 
-// CDN manifest (flat, bilingual subject + html/text) for the verification email.
+export const urlEmailVerification =
+  process.env.URL_EMAIL_VERIFICATION || `${urlApp}/verify-email`;
+
+export const urlPasswordReset =
+  process.env.URL_PASSWORD_RESET || `${urlApp}/reset-password`;
+
+export const urlCoordinatorInvite =
+  process.env.URL_COORDINATOR_INVITE || `${urlApp}/register-with-invite`;
+
 export const emailVerificationManifestUrl =
   CDNBaseUrl + "/emails/verification.json";
 
-// CDN manifest (per-locale subject + html/text) for the password reset email.
 export const emailPasswordResetManifestUrl =
   CDNBaseUrl + "/emails/password-reset.json";
 
-// CDN manifests for outbound volunteer/opportunity emails.
 export const emailSuggestionManifestUrl =
   CDNBaseUrl + "/emails/suggestion.json";
 export const emailSuggestionAccompanyingManifestUrl =
@@ -137,8 +127,14 @@ export const emailNewRegularManifestUrl =
   CDNBaseUrl + "/emails/confirmation.json";
 export const emailNewAccompanyingManifestUrl =
   CDNBaseUrl + "/emails/confirmationaccompanying.json";
-// Per-locale (en/de) manifest for the "you were tagged" email (be#1075).
+
 export const emailTaggedManifestUrl = CDNBaseUrl + "/emails/tagged.json";
+export const emailCgcApplicationManifestUrl =
+  CDNBaseUrl + "/emails/cgcapplication.json";
+export const cgcApplicationResendGuardMs = 60 * 1000;
+export const cgcApplicationFormFileName = "EFZ_Antrag_V.pdf";
+export const cgcApplicationFormUrl =
+  CDNBaseUrl + "/emails/" + cgcApplicationFormFileName;
 
 export const emailFromVolunteer =
   process.env.EMAIL_FROM_VOLUNTEER || "volunteer@need4deed.org";
@@ -146,28 +142,32 @@ export const emailFromContact =
   process.env.EMAIL_FROM_CONTACT || "contact@need4deed.org";
 export const emailFromAccompanying =
   process.env.EMAIL_FROM_ACCOMPANYING || "accompanying@need4deed.org";
+export const emailFromCommunity =
+  process.env.EMAIL_FROM_COMMUNITY || "community@need4deed.org";
 export const emailFromNotify =
   process.env.EMAIL_FROM_NOTIFY || "coordinators@need4deed.org";
-// Where ValidatingEmailTransport reports a suspended, invalid outbound email.
+
 export const errorEmailRecipient =
   process.env.ERROR_EMAIL || "dev@need4deed.org";
-// How long a fetched email manifest is cached in-memory (default 10 min).
+
 export const emailTemplateTtlMs =
   Number(process.env.EMAIL_TEMPLATE_TTL_MS) || 10 * 60 * 1000;
-// Timeout for fetching the email manifest from the CDN (default 5s).
+
+export const emailTemplateRetryMs = 60 * 1000;
 export const emailTemplateFetchTimeoutMs =
   Number(process.env.EMAIL_TEMPLATE_FETCH_TIMEOUT_MS) || 5000;
 
-export const REFRESH_LIFESPAN_MS = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
-export const ACCESS_LIFESPAN_MS = 15 * 60 * 1000; // 15 minutes in milliseconds
-export const VERIFY_LIFESPAN_MS = 24 * 60 * 60 * 1000; // 24h in milliseconds
-export const RESET_LIFESPAN_MS = 60 * 60 * 1000; // 60 minutes in milliseconds
-export const COORDINATOR_INVITE_LIFESPAN_MS = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
-export const pluginTimeout = 300 * 1000; // 30s in milliseconds
+export const REFRESH_LIFESPAN_MS = 7 * 24 * 60 * 60 * 1000;
+export const REFRESH_GRACE_MS = 24 * 60 * 60 * 1000;
+export const ACCESS_LIFESPAN_MS = 15 * 60 * 1000;
+export const VERIFY_LIFESPAN_MS = 24 * 60 * 60 * 1000;
+export const RESET_LIFESPAN_MS = 60 * 60 * 1000;
+export const COORDINATOR_INVITE_LIFESPAN_MS = 7 * 24 * 60 * 60 * 1000;
+export const pluginTimeout = 300 * 1000;
 
 export const accessCookieName = "access";
 export const refreshCookieName = "refresh";
-// Header for direct (non-login) API key auth — see src/server/plugins/jwt.ts.
+
 export const apiKeyHeaderName = "x-api-key";
 export const cookieOptions = {
   signed: TRUTHY.has(process.env.SIGN_COOKIES || ""),
@@ -179,7 +179,6 @@ export const cookieOptions = {
   path: "/",
 };
 
-// Provider-neutral from address; must be a verified sender in the email provider.
 export const defaultFrom = process.env.EMAIL_FROM || "";
 
 export const isDev = process.env.NODE_ENV === "development";
@@ -196,9 +195,10 @@ export const defaultPageSize = 12;
 
 export const titleOrphanageAgent = "Orphanage For Opportunities";
 
-// sv-SE locale yields ISO-like formatting
+export const berlinTimeZone = "Europe/Berlin";
+
 export const berlinDateTimeFormat = new Intl.DateTimeFormat("sv-SE", {
-  timeZone: "Europe/Berlin",
+  timeZone: berlinTimeZone,
   year: "numeric",
   month: "2-digit",
   day: "2-digit",

@@ -1,4 +1,8 @@
-import { OpportunitySortField, SortOrder } from "need4deed-sdk";
+import {
+  OpportunitySortField,
+  QueryParamsKeys,
+  SortOrder,
+} from "need4deed-sdk";
 import { getRef } from "../utils";
 
 const paginationProps = {
@@ -18,6 +22,26 @@ export const langQuerySchema = {
   properties: langProp,
 };
 
+export const otherOpportunityListQuerySchema = {
+  type: "object",
+  properties: {
+    ...paginationProps,
+    ...langProp,
+    search: { type: "string", maxLength: 100 },
+  },
+  additionalProperties: false,
+};
+
+export const eventListQuerySchema = {
+  type: "object",
+  properties: {
+    ...langProp,
+    search: { type: "string" },
+    from: { type: "string" },
+    to: { type: "string" },
+  },
+};
+
 const sortOrderProps = {
   sortOrder: {
     type: "string",
@@ -25,9 +49,20 @@ const sortOrderProps = {
   },
 };
 
-// Opportunity-list-only: which field `sortOrder` applies to. Not part of
-// `sortOrderProps` since sorting by start date is meaningless for
-// agent/volunteer/user lists that also reuse that shared prop set.
+const commuteFilterProps = {
+  [QueryParamsKeys.COMMUTE_POSTCODE]: { type: "string", pattern: "^[0-9]{5}$" },
+  [QueryParamsKeys.MAX_COMMUTE_MINUTES]: {
+    type: "integer",
+    minimum: 1,
+    maximum: 600,
+  },
+};
+
+const commuteFilterDependencies = {
+  [QueryParamsKeys.COMMUTE_POSTCODE]: [QueryParamsKeys.MAX_COMMUTE_MINUTES],
+  [QueryParamsKeys.MAX_COMMUTE_MINUTES]: [QueryParamsKeys.COMMUTE_POSTCODE],
+};
+
 const sortByProps = {
   sortBy: {
     type: "string",
@@ -42,9 +77,6 @@ export const opportunityListQuerySchema = {
     ...sortOrderProps,
     ...sortByProps,
     ...langProp,
-    // Calendar view (be#889): filter by Opportunity.onetimer.date range,
-    // top-level (not nested in `filter`) since they're specific to this
-    // list endpoint, matching `sortBy`.
     appointmentDateFrom: { type: "string" },
     appointmentDateTo: { type: "string" },
     hasAppointmentDate: { type: "boolean" },
@@ -54,6 +86,12 @@ export const opportunityListQuerySchema = {
       properties: {
         language: { type: "array", items: { type: "string" } },
         district: { type: "array", items: { type: "string" } },
+        availability: {
+          anyOf: [
+            { type: "string" },
+            { type: "array", items: { type: "string" } },
+          ],
+        },
         type: {
           type: "array",
           items: getRef("OpportunityType#"),
@@ -62,7 +100,9 @@ export const opportunityListQuerySchema = {
           type: "array",
           items: getRef("OpportunityStatusType#"),
         },
+        ...commuteFilterProps,
       },
+      dependencies: commuteFilterDependencies,
     },
     additionalProperties: false,
   },
@@ -91,15 +131,14 @@ export const agentListQuerySchema = {
   additionalProperties: false,
 };
 
+const OWNER_AGENT_PATTERN = "^(none|[1-9][0-9]{0,8})$";
+
 export const volunteerListQuerySchema = {
   type: "object",
   properties: {
     ...paginationProps,
     ...langProp,
     ...sortOrderProps,
-    // Selects which relations the list loads: "table" loads only what the
-    // table view renders (languages + locations); "card" (default) loads all
-    // collections. Lets the table view skip activities/skills/availability.
     listType: { type: "string", enum: ["card", "table"] },
     filter: {
       type: "object",
@@ -129,11 +168,25 @@ export const volunteerListQuerySchema = {
             { type: "array", items: { type: "string" } },
           ],
         },
-        availability: { type: "string" },
+        availability: {
+          anyOf: [
+            { type: "string" },
+            { type: "array", items: { type: "string" } },
+          ],
+        },
         district: {
           anyOf: [
             { type: "string" },
             { type: "array", items: { type: "string" } },
+          ],
+        },
+        ownerAgent: {
+          anyOf: [
+            { type: "string", pattern: OWNER_AGENT_PATTERN },
+            {
+              type: "array",
+              items: { type: "string", pattern: OWNER_AGENT_PATTERN },
+            },
           ],
         },
         engagement: {
@@ -148,7 +201,9 @@ export const volunteerListQuerySchema = {
             { type: "array", items: { type: "string" } },
           ],
         },
+        ...commuteFilterProps,
       },
+      dependencies: commuteFilterDependencies,
       additionalProperties: false,
     },
   },
@@ -166,10 +221,6 @@ export const userListQuerySchema = {
   additionalProperties: false,
 };
 
-// Field names/types here must mirror need4deed-sdk's ApiPostListQuery (which
-// QuerystringPostList aliases, see endpoint-handlers.ts) — this AJV schema
-// isn't derived from that type, so a future SDK field addition/rename won't
-// surface here on its own; update both by hand together.
 export const postListQuerySchema = {
   type: "object",
   properties: {
@@ -190,10 +241,11 @@ export const volunteerOpportunityListQuerySchema = {
     status: getRef("OpportunityStatusType#"),
     agentId: { type: "number", minimum: 1 },
     search: { type: "string" },
-    german: { type: "boolean" },
     activity: { type: "string" },
     skill: { type: "string" },
-    availability: { type: "string" },
+    availability: {
+      anyOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
+    },
     district: { type: "string" },
   },
   required: ["type", "status"],

@@ -1,19 +1,18 @@
 import { ApiEventN4DGet, ApiEventN4DGetList, Lang } from "need4deed-sdk";
 import EventN4D from "../../data/entity/event/event.entity";
 
-// Resolves the translation matching the requested language; falls back to
-// whatever translation exists rather than dropping the event from the feed
-// just because it hasn't been authored in that language yet (be#903).
-function resolveTranslation(event: EventN4D, language: Lang) {
+export function resolveEventTranslation(event: EventN4D, language: Lang) {
+  const translations = event.eventTranslation ?? [];
   return (
-    event.eventTranslation?.find((t) => t.language?.isoCode === language) ??
-    event.eventTranslation?.[0]
+    translations.find((t) => t.language?.isoCode === language) ??
+    translations.find((t) => t.languageId === event.languageId) ??
+    translations.reduce<(typeof translations)[number] | undefined>(
+      (lowest, t) => (!lowest || t.id < lowest.id ? t : lowest),
+      undefined,
+    )
   );
 }
 
-// additionalInfo is an untyped jsonb column — guard against anything other
-// than an array of strings reaching the response schema (which requires
-// exactly that shape) and 500ing the whole public list over one bad row.
 function sanitizeAdditionalInfo(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) {
     return undefined;
@@ -21,16 +20,15 @@ function sanitizeAdditionalInfo(value: unknown): string[] | undefined {
   return value.every((item) => typeof item === "string") ? value : undefined;
 }
 
+export type ResolvedEventTranslation = ReturnType<
+  typeof resolveEventTranslation
+>;
+
 export function dtoEventN4DGetList(
   event: EventN4D,
-  language: Lang,
+  translation: ResolvedEventTranslation,
   isPrivileged: boolean,
 ): ApiEventN4DGetList | null {
-  const translation = resolveTranslation(event, language);
-  // A coordinator/admin still needs to see (and translate) an event with no
-  // translation yet — that's exactly the "manage drafts" case this route
-  // promises them. Only drop it for everyone else, since untranslated
-  // content has nothing meaningful to show on the public site.
   if (!translation && !isPrivileged) {
     return null;
   }
@@ -38,9 +36,6 @@ export function dtoEventN4DGetList(
   return {
     id: event.id,
     active: event.isActive,
-    // title/menuTitle are nullable in EventTranslation but required on the
-    // API shape — a translation row without them (or no translation row at
-    // all) is incomplete content, not a reason to 500 the whole feed.
     title: translation?.title ?? "",
     subTitle: translation?.subtitle,
     menuTitle: translation?.menuTitle ?? "",
@@ -53,29 +48,25 @@ export function dtoEventN4DGetList(
     description: translation?.description ?? "",
     shortDescription: translation?.shortDescription ?? "",
     linkRSVP: event.rsvpLink,
+    hostName: event.hostName,
     additionalTitle: translation?.additionalTitle,
     additionalInfo: sanitizeAdditionalInfo(translation?.additionalInfo),
   };
 }
 
-// Full detail shape (SDK ApiEventN4DGet), adding the fields ApiEventN4DGetList
-// doesn't carry. Used by POST /event's response (be#904) — no GET /event/:id
-// exists yet, but the SDK type is already the right shape for "give the
-// caller back everything they just submitted".
 export function dtoEventN4DGet(
   event: EventN4D,
   language: Lang,
   isPrivileged: boolean,
 ): ApiEventN4DGet | null {
-  const list = dtoEventN4DGetList(event, language, isPrivileged);
+  const translation = resolveEventTranslation(event, language);
+  const list = dtoEventN4DGetList(event, translation, isPrivileged);
   if (!list) {
     return null;
   }
-  const translation = resolveTranslation(event, language);
 
   return {
     ...list,
-    hostName: event.hostName,
     time: translation?.timeStr,
     locationLink: event.locationLink,
     followUpText: translation?.followupText,

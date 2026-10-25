@@ -2,10 +2,6 @@ import { EventN4DType } from "need4deed-sdk";
 import { getRef } from "../utils";
 import { responseErrors } from "./responseErrors";
 
-// Item shape for GET /event (SDK ApiEventN4DGetList). Inline, not $ref'd —
-// event_n4d is a new domain, not yet part of the hand-maintained
-// sdk-types.json bundle (which is already large enough as-is). Exported so a
-// future GET /event/:id (epic #458) can reuse it instead of re-copying it.
 export const eventItemSchema = {
   type: "object",
   properties: {
@@ -23,6 +19,7 @@ export const eventItemSchema = {
     description: { type: "string" },
     shortDescription: { type: "string" },
     linkRSVP: { type: "string" },
+    hostName: { type: ["string", "null"] },
     additionalTitle: { type: ["string", "null"] },
     additionalInfo: {
       type: ["array", "null"],
@@ -44,13 +41,10 @@ export const eventItemSchema = {
   additionalProperties: false,
 };
 
-// Full detail shape for POST /event's response (SDK ApiEventN4DGet) — adds
-// the fields eventItemSchema (the list shape) doesn't carry.
 export const eventFullItemSchema = {
   ...eventItemSchema,
   properties: {
     ...eventItemSchema.properties,
-    hostName: { type: ["string", "null"] },
     time: { type: ["string", "null"] },
     locationLink: { type: ["string", "null"] },
     followUpText: { type: ["string", "null"] },
@@ -73,7 +67,19 @@ export const eventListResponseSchema = {
   ...responseErrors,
 };
 
-// Body for POST /event (SDK ApiEventN4DTranslationInput).
+export const eventGetResponseSchema = {
+  200: {
+    type: "object",
+    required: ["message", "data"],
+    properties: {
+      message: { type: "string" },
+      data: eventFullItemSchema,
+    },
+    additionalProperties: false,
+  },
+  ...responseErrors,
+};
+
 const eventTranslationInputSchema = {
   type: "object",
   properties: {
@@ -100,8 +106,6 @@ const eventTranslationInputSchema = {
   additionalProperties: false,
 };
 
-// Body for POST /event (SDK ApiEventN4DCreate). translations requires at
-// least one entry — enforced here rather than in application code.
 export const eventCreateBodySchema = {
   type: "object",
   properties: {
@@ -138,15 +142,6 @@ export const eventCreateResponseSchema = {
   ...responseErrors,
 };
 
-// Body for PATCH /event/:id (SDK ApiEventN4DPatch). Everything's optional —
-// omitted = unchanged. Only the fields that are actually nullable columns
-// (dateEnd, pic, locationLink, followUpLink, hostName) accept null-to-clear;
-// date/type/linkRSVP/address/active reject null here even though the SDK's
-// VoidableProps type technically allows it, since those columns are
-// required and "clear this required field" isn't a meaningful request.
-// translations is a full-content upsert per language (see write-event.ts),
-// not a field-by-field patch — reuses the same item shape as create, so an
-// included entry still needs title/menuTitle/description/shortDescription.
 export const eventPatchBodySchema = {
   type: "object",
   properties: {

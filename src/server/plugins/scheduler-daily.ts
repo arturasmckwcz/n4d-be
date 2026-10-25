@@ -1,9 +1,11 @@
 import { FastifyInstance } from "fastify";
 import fp from "fastify-plugin";
+import { berlinToday, isWorkingDay } from "need4deed-sdk";
 import cron from "node-cron";
+import { berlinTimeZone } from "../../config";
 import logger from "../../logger";
 import { activateDueOnetimers } from "../../services/jobs/activate-due-onetimers";
-import { berlinToday, isWorkingDay } from "../../services/jobs/german-holidays";
+import { pruneRefreshSessions } from "../../services/jobs/prune-refresh-sessions";
 import { scanAccompanyNotFound } from "../../services/jobs/scan-accompany-not-found";
 import { scanExpiredOnetimers } from "../../services/jobs/scan-expired-onetimers";
 import { scanPostMatchCheckup } from "../../services/jobs/scan-post-match-checkup";
@@ -11,27 +13,20 @@ import { scanRegularUpdate } from "../../services/jobs/scan-regular-update";
 import { scanStalePending } from "../../services/jobs/scan-stale-pending";
 import { runNamedCronJobs, runWithAdvisoryLock } from "../utils";
 
-// Unique integer key for this app's advisory lock — prevents duplicate runs
-// across multiple ECS instances.
 const SCHEDULER_LOCK_ID = 20240707;
+const ACCOMPANY_NOT_FOUND_LOCK_ID = 20261020;
 
-// Daily at the 6AM hour Berlin time, by default.
 const CRON_SCHEDULE_DAILY = process.env.CRON_SCHEDULE_DAILY || "0 6 * * *";
+const CRON_SCHEDULE_ACCOMPANY_NOT_FOUND =
+  process.env.CRON_SCHEDULE_ACCOMPANY_NOT_FOUND || "0 10 * * *";
 
 async function schedulerDailyPlugin(fastify: FastifyInstance): Promise<void> {
-  // node-cron handles DST automatically when timezone is set.
   const task = cron.schedule(
     CRON_SCHEDULE_DAILY,
     async () => {
       try {
         logger.info("scheduler: running daily scans");
 
-        // Run in this order, sequentially: their WHERE clauses can both
-        // match the same onetimer opportunity in the same tick (e.g. one
-        // stuck in SEARCHING past its date with a MATCHED volunteer), and
-        // running them concurrently let whichever transaction committed
-        // last silently win, leaving an unpredictable ACTIVE/PAST state
-        // (be#987 review).
         await runWithAdvisoryLock(
           () =>
             runNamedCronJobs(
@@ -44,10 +39,6 @@ async function schedulerDailyPlugin(fastify: FastifyInstance): Promise<void> {
                   name: "scanExpiredOnetimers",
                   run: () => scanExpiredOnetimers(fastify),
                 },
-                // The cron jobs' emails, posted to Slack #cron-notifications
-                // (be#1088), after the status jobs above. Each scan takes
-                // only what crossed its threshold since yesterday's run, so
-                // every row is posted once.
                 {
                   name: "scanStalePending",
                   run: () => scanStalePending(fastify),
@@ -60,30 +51,65 @@ async function schedulerDailyPlugin(fastify: FastifyInstance): Promise<void> {
                   name: "scanRegularUpdate",
                   run: () => scanRegularUpdate(fastify),
                 },
-                // Working days only: each takes the appointments 4 working
-                // days ahead together with the weekend or holidays after
-                // them, so a run on a non-working day would repeat them.
-                ...(isWorkingDay(berlinToday())
-                  ? [
-                      {
-                        name: "scanAccompanyNotFound",
-                        run: () => scanAccompanyNotFound(fastify),
-                      },
-                    ]
-                  : []),
+                {
+                  name: "pruneRefreshSessions",
+                  run: () => pruneRefreshSessions(fastify),
+                },
               ],
               { sequential: true },
             ),
           SCHEDULER_LOCK_ID,
         );
       } catch (err) {
-        logger.error({ err }, "scheduler: unhandled error in cron callback");
+        logger.error(
+          { err },
+          "scheduler: unhandled error in daily cron callback",
+        );
       }
     },
-    { timezone: "Europe/Berlin" },
+    { timezone: berlinTimeZone },
   );
 
-  fastify.addHook("onClose", () => task.stop());
+  if (!cron.validate(CRON_SCHEDULE_ACCOMPANY_NOT_FOUND)) {
+    logger.error(
+      { schedule: CRON_SCHEDULE_ACCOMPANY_NOT_FOUND },
+      "scheduler: CRON_SCHEDULE_ACCOMPANY_NOT_FOUND is not a valid cron expression — accompany-not-found scan not scheduled",
+    );
+    fastify.addHook("onClose", () => task.stop());
+    return;
+  }
+
+  const accompanyNotFoundTask = cron.schedule(
+    CRON_SCHEDULE_ACCOMPANY_NOT_FOUND,
+    async () => {
+      try {
+        if (!isWorkingDay(berlinToday())) {
+          return;
+        }
+        await runWithAdvisoryLock(
+          () =>
+            runNamedCronJobs([
+              {
+                name: "scanAccompanyNotFound",
+                run: () => scanAccompanyNotFound(fastify),
+              },
+            ]),
+          ACCOMPANY_NOT_FOUND_LOCK_ID,
+        );
+      } catch (err) {
+        logger.error(
+          { err },
+          "scheduler: unhandled error in accompany-not-found cron callback",
+        );
+      }
+    },
+    { timezone: berlinTimeZone },
+  );
+
+  fastify.addHook("onClose", () => {
+    task.stop();
+    accompanyNotFoundTask.stop();
+  });
 }
 
 export default fp(schedulerDailyPlugin, {

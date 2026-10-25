@@ -1,63 +1,19 @@
 import { FastifyInstance, FastifyPluginOptions, FastifyRequest } from "fastify";
-import { AgentMembershipStatus, UserRole } from "need4deed-sdk";
-import { NotFoundError, UnauthorizedError } from "../../../config";
+import { NotFoundError } from "../../../config";
 import OpportunityEventRegistration from "../../../data/entity/opportunity-event-registration.entity";
 import { dtoOpportunityEventRegistration } from "../../../services";
 import {
   idParamSchema,
   opportunityEventRegistrationListResponseSchema,
 } from "../../schema";
+import { assertAgentMemberOrStaffOr403, assertRoleIn } from "../../utils";
 
-// Only these roles may view an event's registrations at all. An AGENT is
-// further scoped below to opportunities belonging to their own agent — the
-// registrant's name/email/phone is PII, and be/CLAUDE.md only calls out
-// COORDINATOR as PII-safe, so AGENT access is deliberately ownership-scoped
-// rather than blanket (see be#879 discussion).
-function assertHasRegistrationsRole(request: FastifyRequest): void {
-  const role = request.authUser?.role;
-  if (
-    role !== UserRole.COORDINATOR &&
-    role !== UserRole.AGENT &&
-    role !== UserRole.ADMIN
-  ) {
-    throw new UnauthorizedError();
-  }
-}
-
-async function assertCanViewRegistrations(
-  fastify: FastifyInstance,
-  request: FastifyRequest,
-  agentId?: number,
-): Promise<void> {
-  const role = request.authUser?.role;
-  if (role === UserRole.COORDINATOR || role === UserRole.ADMIN) {
-    return;
-  }
-
-  const personId = request.authUser?.personId;
-  const membership =
-    personId !== undefined && agentId !== undefined
-      ? await fastify.db.agentPersonRepository.findOneBy({
-          agentId,
-          personId,
-          status: AgentMembershipStatus.ACTIVE,
-        })
-      : null;
-  if (!membership) {
-    throw new UnauthorizedError(
-      "Agents can only view registrations for their own agent's opportunities.",
-    );
-  }
-}
-
-// Shared by both handlers below so the role gate, 404, and ownership check
-// can't drift apart between the JSON list and the CSV export.
 async function getAuthorizedRegistrations(
   fastify: FastifyInstance,
   request: FastifyRequest,
   opportunityId: number,
 ): Promise<OpportunityEventRegistration[]> {
-  assertHasRegistrationsRole(request);
+  assertRoleIn(request);
 
   const opportunity = await fastify.db.opportunityRepository.findOne({
     where: { id: opportunityId },
@@ -65,7 +21,11 @@ async function getAuthorizedRegistrations(
   if (!opportunity) {
     throw new NotFoundError(`Opportunity (id:${opportunityId}) not found.`);
   }
-  await assertCanViewRegistrations(fastify, request, opportunity.agentId);
+  await assertAgentMemberOrStaffOr403(
+    request,
+    opportunity.agentId,
+    "Agents can only view registrations for their own agent's opportunities.",
+  );
 
   return fastify.db.opportunityEventRegistrationRepository.find({
     where: { opportunityId },
@@ -74,10 +34,6 @@ async function getAuthorizedRegistrations(
 }
 
 function csvCell(value: string): string {
-  // Neutralize formula injection (OWASP CSV injection): fullName/message
-  // come from the public, unauthenticated POST /event-registration form, and
-  // a leading =, +, -, or @ is interpreted as a live formula by Excel/Sheets
-  // once a coordinator/agent opens this export.
   const guarded = /^[=+\-@]/.test(value) ? `'${value}` : value;
   return /["\r\n,]/.test(guarded)
     ? `"${guarded.replace(/"/g, '""')}"`

@@ -5,12 +5,9 @@ import Accompanying from "../../../data/entity/opportunity/accompanying.entity";
 import Agent from "../../../data/entity/opportunity/agent.entity";
 import Opportunity from "../../../data/entity/opportunity/opportunity.entity";
 import Person from "../../../data/entity/person.entity";
+import { isStaffRole } from "../data/is-staff-role";
 import { CallerVisibility } from "./visible-persons";
 
-// PII columns masked for callers not permitted to see the owning Person.
-// Exported for reuse by the INACTIVE-agent masking (be#885), which needs the
-// same "hide a volunteer's identity" field set but is gated on the agent's
-// engagementStatus rather than personIds visibility.
 export const PERSON_PII_FIELDS = [
   "firstName",
   "middleName",
@@ -21,13 +18,9 @@ export const PERSON_PII_FIELDS = [
   "avatarUrl",
 ] as const;
 const ADDRESS_PII_FIELDS = ["title", "street", "city"] as const;
-// Refugee contact details carried as scalars on an opportunity's accompanying.
 const ACCOMPANYING_PII_FIELDS = ["name", "address", "phone", "email"] as const;
-// Free-text comment body (may name people / carry contact details).
 const COMMENT_PII_FIELDS = ["text"] as const;
 
-// A single random char + "***" — hides both the original value's length and its
-// first letter (so "John" -> e.g. "x***"), unlike a fixed "****".
 export function maskString(): string {
   const c = String.fromCharCode(97 + Math.floor(Math.random() * 26));
   return `${c}***`;
@@ -44,31 +37,38 @@ export function maskFields(
   }
 }
 
-// Nulls out an address's postcode coordinates (be#661's map-pin lat/lon) by
-// replacing the postcode reference with a copy — a Postcode row is shared
-// across every Address in the same area, so mutating its fields in place
-// would leak into every other (possibly visible) address pointing at the
-// same postcode.
-function maskAddressCoordinates(address: Record<string, unknown>): void {
-  const postcode = address.postcode;
+function maskPostcode(
+  owner: Record<string, unknown>,
+  { hideValue }: { hideValue: boolean },
+): void {
+  const postcode = owner.postcode;
   if (postcode && typeof postcode === "object") {
-    address.postcode = { ...postcode, latitude: null, longitude: null };
+    owner.postcode = {
+      ...postcode,
+      latitude: null,
+      longitude: null,
+      ...(hideValue ? { value: null } : {}),
+    };
   }
 }
 
-function maskAddress(address: Record<string, unknown>): void {
+function maskAddress(
+  address: Record<string, unknown>,
+  { hidePostcode }: { hidePostcode: boolean },
+): void {
   maskFields(address, ADDRESS_PII_FIELDS);
-  maskAddressCoordinates(address);
+  maskPostcode(address, { hideValue: hidePostcode });
 }
 
-// An agent (RAC) whose identity (title, address) the caller may see
-// unmasked: one they're a member of, or — for a VOLUNTEER — one owning an
-// opportunity they're matched to (be#1039).
+interface AddressSets {
+  visible: WeakSet<object>;
+  ofAgents: WeakSet<object>;
+}
+
 function isAgentVisible(agentId: number, ctx: CallerVisibility): boolean {
   return ctx.agentIds.has(agentId) || ctx.matchedAgentIds.has(agentId);
 }
 
-// An entity whose comments/accompanying the caller may see unmasked.
 function isEntityVisible(
   entityType: EntityTableName,
   entityId: number,
@@ -80,44 +80,26 @@ function isEntityVisible(
     case EntityTableName.AGENT:
       return ctx.agentIds.has(entityId);
     default:
-      // VOLUNTEER and the rest: no inherited visibility (conservative).
       return false;
   }
 }
 
-// A comment is visible if the caller authored it, or its parent entity is
-// visible AND the author isn't a COORDINATOR/ADMIN (internal notes stay masked
-// even on an entity the caller owns).
 function isCommentVisible(comment: Comment, ctx: CallerVisibility): boolean {
   if (comment.userId === ctx.userId) {
     return true;
   }
-  // A missing author role defaults to USER (non-privileged) — entity visibility
-  // then decides.
   const authorRole = comment.user?.role ?? UserRole.USER;
-  if (authorRole === UserRole.COORDINATOR || authorRole === UserRole.ADMIN) {
+  if (isStaffRole(authorRole)) {
     return false;
   }
   return isEntityVisible(comment.entityType, comment.entityId, ctx);
 }
 
-// Address is a real OneToMany off Person/Organization (household members,
-// agent contacts sharing one office, etc.), and TypeORM's relation loader
-// returns the *same* Address (and Postcode) object instance for every row
-// that references it — confirmed empirically: two Persons sharing an
-// addressId, loaded via relationLoadStrategy "query", get
-// `person.address === otherPerson.address`. Deciding whether to mask an
-// address from a single Person/Agent's own visibility would then be
-// order-dependent: whichever of two co-residents the walker reaches first
-// determines the masked/unmasked outcome for *both*, since mutating one
-// mutates the shared object for the other too. `collectVisibleAddresses`
-// pre-scans the whole graph so an address already known to be visible via
-// some Person/Agent is never masked, regardless of walk order.
-function collectVisibleAddresses(
+function collectAddresses(
   node: unknown,
   ctx: CallerVisibility,
   seen: WeakSet<object>,
-  visibleAddresses: WeakSet<object>,
+  addresses: AddressSets,
 ): void {
   if (node === null || typeof node !== "object") {
     return;
@@ -129,7 +111,7 @@ function collectVisibleAddresses(
 
   if (Array.isArray(node)) {
     for (const item of node) {
-      collectVisibleAddresses(item, ctx, seen, visibleAddresses);
+      collectAddresses(item, ctx, seen, addresses);
     }
     return;
   }
@@ -140,47 +122,34 @@ function collectVisibleAddresses(
       node.address &&
       typeof node.address === "object"
     ) {
-      visibleAddresses.add(node.address);
+      addresses.visible.add(node.address);
     }
   } else if (node instanceof Agent) {
-    if (
-      isAgentVisible(node.id, ctx) &&
-      node.address &&
-      typeof node.address === "object"
-    ) {
-      visibleAddresses.add(node.address);
+    if (node.address && typeof node.address === "object") {
+      addresses.ofAgents.add(node.address);
+      if (isAgentVisible(node.id, ctx)) {
+        addresses.visible.add(node.address);
+      }
     }
   }
 
   for (const key of Object.keys(node)) {
-    collectVisibleAddresses(
+    collectAddresses(
       (node as Record<string, unknown>)[key],
       ctx,
       seen,
-      visibleAddresses,
+      addresses,
     );
   }
 }
 
-/**
- * Masks PII the caller may not see, in place, on the loaded entity graph (run
- * before the DTO). TypeORM returns class instances, so PII is identified by
- * `instanceof`; reference objects and non-PII entities pass through untouched
- * (the walker still descends them to reach nested PII). A WeakSet guards the
- * entity graph's cycles.
- *
- * Masked: a Person not in `personIds` (and its Address, unless that Address
- * is also reachable from a visible Person/Agent elsewhere in the same
- * response — see `collectVisibleAddresses`); an Agent's Address when the
- * agent isn't visible (see isAgentVisible, same shared-Address rule), plus
- * its title for a VOLUNTEER caller (be#1039); a standalone Address reached some other way; an
- * Opportunity's accompanying when the opportunity isn't visible; a Comment
- * that isn't visible (see isCommentVisible).
- */
 export function maskPii<T>(data: T, ctx: CallerVisibility): T {
-  const visibleAddresses = new WeakSet<object>();
-  collectVisibleAddresses(data, ctx, new WeakSet<object>(), visibleAddresses);
-  walk(data, ctx, new WeakSet<object>(), visibleAddresses);
+  const addresses: AddressSets = {
+    visible: new WeakSet<object>(),
+    ofAgents: new WeakSet<object>(),
+  };
+  collectAddresses(data, ctx, new WeakSet<object>(), addresses);
+  walk(data, ctx, new WeakSet<object>(), addresses);
   return data;
 }
 
@@ -188,7 +157,7 @@ function walk(
   node: unknown,
   ctx: CallerVisibility,
   seen: WeakSet<object>,
-  visibleAddresses: WeakSet<object>,
+  addresses: AddressSets,
 ): void {
   if (node === null || typeof node !== "object") {
     return;
@@ -200,7 +169,7 @@ function walk(
 
   if (Array.isArray(node)) {
     for (const item of node) {
-      walk(item, ctx, seen, visibleAddresses);
+      walk(item, ctx, seen, addresses);
     }
     return;
   }
@@ -210,49 +179,44 @@ function walk(
     if (!isVisible) {
       maskFields(node as unknown as Record<string, unknown>, PERSON_PII_FIELDS);
     }
-    // Claim the person's own Address so the standalone-Address rule below can't
-    // re-mask a visible person's address (and don't double-mask a hidden one).
     if (node.address && typeof node.address === "object") {
-      if (!visibleAddresses.has(node.address)) {
-        maskAddress(node.address as unknown as Record<string, unknown>);
+      if (!addresses.visible.has(node.address)) {
+        maskAddress(node.address as unknown as Record<string, unknown>, {
+          hidePostcode: addresses.ofAgents.has(node.address),
+        });
       }
       seen.add(node.address);
     }
   } else if (node instanceof Agent) {
-    // A RAC's name is PII to a volunteer until they're matched (be#1039).
-    // Scoped to VOLUNTEER: other non-privileged roles see agent titles as
-    // before. Unlike Address, the title lives on the Agent itself, so a shared
-    // instance always gets the same (per-agent) decision.
     if (ctx.role === UserRole.VOLUNTEER && !isAgentVisible(node.id, ctx)) {
       maskFields(node as unknown as Record<string, unknown>, ["title"]);
     }
-    // Claim the agent's own Address so the standalone-Address rule below
-    // can't re-mask it when it's visible (via this agent, or some other
-    // visible Person/Agent sharing the same Address).
     if (
       node.address &&
       typeof node.address === "object" &&
-      visibleAddresses.has(node.address)
+      addresses.visible.has(node.address)
     ) {
       seen.add(node.address);
     }
   } else if (node instanceof Address) {
-    // Reached not via a visible Person/Agent (e.g. another agent's address)
-    // -> standalone PII, mask it, unless it's known visible via some other
-    // Person/Agent in this same response.
-    if (!visibleAddresses.has(node)) {
-      maskAddress(node as unknown as Record<string, unknown>);
+    if (!addresses.visible.has(node)) {
+      maskAddress(node as unknown as Record<string, unknown>, {
+        hidePostcode: addresses.ofAgents.has(node),
+      });
     }
   } else if (node instanceof Opportunity) {
-    // Accompanying (refugee contact) follows its opportunity's visibility.
-    if (
-      !ctx.opportunityIds.has(node.id) &&
-      node.accompanying instanceof Accompanying
-    ) {
-      maskFields(
-        node.accompanying as unknown as Record<string, unknown>,
-        ACCOMPANYING_PII_FIELDS,
-      );
+    if (!ctx.opportunityIds.has(node.id)) {
+      if (node.accompanying instanceof Accompanying) {
+        maskFields(
+          node.accompanying as unknown as Record<string, unknown>,
+          ACCOMPANYING_PII_FIELDS,
+        );
+      }
+      if (node.deal && typeof node.deal === "object") {
+        maskPostcode(node.deal as unknown as Record<string, unknown>, {
+          hideValue: true,
+        });
+      }
     }
   } else if (node instanceof Comment) {
     if (!isCommentVisible(node, ctx)) {
@@ -264,6 +228,6 @@ function walk(
   }
 
   for (const key of Object.keys(node)) {
-    walk((node as Record<string, unknown>)[key], ctx, seen, visibleAddresses);
+    walk((node as Record<string, unknown>)[key], ctx, seen, addresses);
   }
 }

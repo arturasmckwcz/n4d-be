@@ -15,6 +15,7 @@ import Accompanying from "../../data/entity/opportunity/accompanying.entity";
 import Opportunity from "../../data/entity/opportunity/opportunity.entity";
 import { Centroid } from "../../data/utils/get-district";
 import logger from "../../logger";
+import { isNoMatchFound } from "../../server/utils/data/no-match-found";
 import {
   formatAppointmentDateTime,
   formatDate,
@@ -29,19 +30,9 @@ import { getAvailability, getCoordinates } from "./utils";
 interface MapPinResolution {
   lat: number | null;
   lon: number | null;
-  // Set only when a district-centroid fallback is actually needed (map-
-  // eligible status, agent not geocoded) — lets a caller batch-fetch
-  // centroids for just the opportunities that need one, without
-  // re-implementing this same status/agent-coordinate gating itself.
   neededDistrictId?: number;
 }
 
-// Map-pin coordinates for a card/list-view "map tab" (be#662): only NEW/
-// SEARCHING opportunities get placed on the map, sourced from the agent's
-// own geocoded address, falling back to the opportunity's district centroid.
-// Reads the (already PII-masked, where applicable) entity graph — the
-// agent's postcode is nulled by mask.ts for a caller without visibility into
-// that agent, same as every other agent/person address field.
 function resolveMapPin(opportunity: Opportunity): MapPinResolution {
   if (
     opportunity.status !== OpportunityStatusType.NEW &&
@@ -66,11 +57,6 @@ function resolveMapPin(opportunity: Opportunity): MapPinResolution {
   };
 }
 
-// Exported so the route handler can decide which district ids to batch-
-// fetch centroids for (getDistrictCentroids, data/utils/get-district.ts) —
-// a district's postcodes aren't eagerly loaded onto the entity graph, since
-// most opportunities never need the fallback at all — without duplicating
-// resolveMapPin's status/agent-coordinate gating logic (be#978 review).
 export function getOpportunityDistrictIdNeedingCentroid(
   opportunity: Opportunity,
 ): number | undefined {
@@ -105,12 +91,6 @@ function getOpportunityDescription(opportunity: Opportunity) {
   return opportunity.info;
 }
 
-// Defense-in-depth against be#780: `accompanying` carries refugee PII
-// (name/phone/email/address/language) that only ever belongs to an
-// ACCOMPANYING-type opportunity. Gating serialization on the *current* type
-// here means a leak can't recur from a future write-path bug that leaves a
-// stale/non-cleared row behind — the DTO layer no longer trusts the DB row
-// to already be clean.
 export function accompanyingForType(
   opportunity: Opportunity,
 ): Accompanying | undefined {
@@ -119,9 +99,6 @@ export function accompanyingForType(
     : undefined;
 }
 
-// Best-effort: returns the original submitter if they still hold an
-// agent_person row for the opportunity's agent; otherwise falls back to
-// the current agent representative. Not guaranteed to be the submitter.
 export function getOpportunityContact(
   opportunity: Opportunity,
 ): ApiOpportunityContact {
@@ -146,9 +123,6 @@ export function getOpportunityContact(
   };
 }
 
-// opportunity.deal_id is nullable, so a deal-less opportunity must still
-// serialize (empty lists, null category) instead of 500ing the whole list
-// endpoint it appears in (be#999).
 const EMPTY_DEAL = {
   categoryId: null,
   dealLanguage: [],
@@ -179,6 +153,7 @@ export function dtoOpportunityGetList(
     volunteerType: opportunity.type,
     statusOpportunity: opportunity.status,
     statusMatch: opportunity.statusMatch,
+    noMatchFound: isNoMatchFound(opportunity),
     numberOfVolunteers: opportunity.numberVolunteers,
     createdAt: opportunity.createdAt,
     languages: deal.dealLanguage.filter(Boolean).map((pl) => ({
@@ -202,17 +177,12 @@ export function dtoOpportunityGetList(
     agentId: opportunity.agentId,
     appointmentDate,
     appointmentTime,
-    // Names of the volunteers MATCHED to the opportunity (status opp-matched
-    // only — not pending/active/past links). PII masking runs before this DTO,
-    // so masked names pass through. Needs the
-    // opportunityVolunteer.volunteer.person relation loaded.
     volunteerNames: (opportunity.opportunityVolunteer ?? [])
       .filter((ov) => ov.status === OpportunityVolunteerStatusType.MATCHED)
       .map((ov) => ov.volunteer?.person?.name)
       .filter((name): name is string => Boolean(name)),
     ...getOpportunityCoordinates(opportunity, districtCentroid),
-    // The language title/info were typed in (be#1068); NULL (rows from
-    // before be#1066) counts as German. Needs the originalLanguage relation.
+    postcode: opportunity.deal?.postcode?.value ?? null,
     originalLanguage:
       (opportunity.originalLanguage?.isoCode as Lang | undefined) ?? Lang.DE,
   } as ApiOpportunityGetList;
@@ -250,6 +220,7 @@ export function dtoVolunteerOpportunityGetList(
       deal.dealLanguage,
     ),
     statusMatch: opportunity.statusMatch,
+    postcode: opportunity.deal?.postcode?.value ?? null,
   } as ApiVolunteerOpportunityGetList;
 }
 
@@ -271,7 +242,6 @@ export function dtoOpportunityGet(
   return {
     id: opportunityComments.id,
     title: opportunityComments.title,
-    // See dtoOpportunityGetList (be#1068).
     originalLanguage:
       (opportunityComments.originalLanguage?.isoCode as Lang | undefined) ??
       Lang.DE,
@@ -320,6 +290,7 @@ export function dtoOpportunityGet(
       : undefined,
     comments: opportunityComments.comments.map(commentSerializer),
     statusMatch: opportunityComments.statusMatch,
+    noMatchFound: isNoMatchFound(opportunityComments),
     ...getOpportunityCoordinates(opportunityComments, districtCentroid),
   } as ApiOpportunityGet;
 }

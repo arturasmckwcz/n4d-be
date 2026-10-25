@@ -6,7 +6,7 @@ import {
 } from "need4deed-sdk";
 import { NotFoundError, UnauthorizedError } from "../../config/error/fastify";
 import { idParamSchema } from "../schema";
-import { validatePermissions } from "../utils";
+import { STAFF_ROLES, validatePermissions } from "../utils";
 
 export default async function appreciationRoutes(
   fastify: FastifyInstance,
@@ -50,24 +50,12 @@ export default async function appreciationRoutes(
         throw new NotFoundError(`Appreciation with id:${id} not found.`);
       }
 
-      if (
-        !validatePermissions(
-          appreciation,
-          [UserRole.ADMIN, UserRole.COORDINATOR],
-          request.user,
-        )
-      ) {
+      if (!validatePermissions(appreciation, STAFF_ROLES, request.user)) {
         throw new UnauthorizedError(
           `Permission denied, appreciation with id:${id} not updated.`,
         );
       }
 
-      // `status` is the source of truth, but a caller that only patches
-      // `dateDue`/`dateDelivery` (the pre-be#909 contract) would otherwise
-      // leave it stale — silently desyncing the two. Mirror the old
-      // date-inference rule (`dateDelivery` set -> received, else pending)
-      // whenever `status` itself isn't part of this patch; a caller that
-      // does send `status` (e.g. to set the new "post" state) always wins.
       const patch = { ...request.body };
       if (
         patch.status === undefined &&
@@ -122,13 +110,7 @@ export default async function appreciationRoutes(
         throw new NotFoundError(`Appreciation with id:${id} not found.`);
       }
 
-      if (
-        !validatePermissions(
-          appreciation,
-          [UserRole.ADMIN, UserRole.COORDINATOR],
-          request.user,
-        )
-      ) {
+      if (!validatePermissions(appreciation, STAFF_ROLES, request.user)) {
         throw new UnauthorizedError(
           `Permission denied, appreciation with id:${id} not deleted.`,
         );

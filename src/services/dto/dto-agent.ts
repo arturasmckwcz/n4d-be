@@ -4,6 +4,7 @@ import {
   ApiAgentGetList,
   ApiAgentMembership,
   ApiAgentOpportunity,
+  ApiAgentTagCandidate,
   ApiOpportunityAgent,
   OptionById,
   OptionTitle,
@@ -18,11 +19,6 @@ import { commentSerializer } from "./dto-comment";
 import { dtoSerializePerson } from "./dto-person";
 import { getAvailability, getCoordinates, getLanguages } from "./utils";
 
-// Prefers the real en/de field_translation rows resolved by
-// addAgentTypeServiceTranslations onto `ref.translations`; falls back to the
-// raw, untranslated title (like `district` below) when that enrichment step
-// hasn't run — e.g. a caller that loads the entity without going through the
-// GET /agent or GET /opportunity route handlers.
 function dtoOptionTitle(
   id: number | undefined,
   ref?: { title?: string; translations?: OptionTitle },
@@ -30,8 +26,6 @@ function dtoOptionTitle(
   return { id, title: ref?.translations ?? { de: ref?.title } };
 }
 
-// Serializes an agent<->person membership for the moderation endpoints.
-// Expects the `agent` and `person` relations to be loaded.
 export function dtoSerializeAgentMembership(
   agentPerson: AgentPerson,
 ): ApiAgentMembership {
@@ -45,16 +39,6 @@ export function dtoSerializeAgentMembership(
   };
 }
 
-// Map-pin coordinates for the Agents page map tab (be#1083): the agent's own
-// geocoded address, falling back to its district's centroid — same sources
-// as the opportunity map pin (resolveMapPin, dto-opportunity.ts), minus the
-// status gating: every listed agent is map-eligible. Reads the (already
-// PII-masked, where applicable) entity graph, so a caller without visibility
-// into the agent gets the district centroid, never the agent's own postcode.
-//
-// Exported so the route handler can batch-fetch centroids
-// (getDistrictCentroids) for just the agents that need one, rather than an
-// eager district-postcodes relation on the paginated list query.
 export function getAgentDistrictIdNeedingCentroid(
   agent: Agent,
 ): number | undefined {
@@ -95,7 +79,9 @@ export function dtoAgentGetList(
       agent.representative?.person?.email || agent.organization?.email || "",
     district: { id: agent.districtId, title: { de: agent?.district?.title } },
     unclaimed: agent.unclaimed,
+    statusEngagement: agent.engagementStatus,
     ...getAgentCoordinates(agent, districtCentroid),
+    postcode: agent.address?.postcode?.value ?? null,
   };
 }
 
@@ -115,6 +101,7 @@ export function dtoAgentGet(
     ...dtoAgentGetList(agent, districtCentroid),
     createdAt: agent.createdAt,
     updatedAt: agent.updatedAt,
+    sharesVolunteers: agent.sharesVolunteers ?? false,
     operator: agent?.organization?.title,
     representative: {
       ...dtoSerializePerson(agent?.representative?.person),
@@ -127,7 +114,6 @@ export function dtoAgentGet(
       dtoOptionTitle(as.serviceId, as.service),
     ),
     trustLevel: agent.trustLevel,
-    statusEngagement: agent.engagementStatus,
     agentDetails: dtoAgentDetails(agent),
     comments: agent.comments?.map(commentSerializer),
     languages:
@@ -174,12 +160,6 @@ function dtoAgentDetails(agent: Agent): AgentDetails & {
   };
 }
 
-/**
- * One of an agent's opportunities plus the volunteers linked to it. Response
- * item of GET /agent/:id/opportunity-linked. Expects the
- * `opportunityVolunteer.volunteer.person` relation loaded; person PII is masked
- * upstream by the route's preSerialization hook, so masked values pass through.
- */
 export function dtoAgentOpportunity(
   opportunity: Opportunity,
 ): ApiAgentOpportunity {
@@ -209,5 +189,23 @@ export function dtoAgentOpportunity(
         name: ov.volunteer?.person?.name,
         avatarUrl: ov.volunteer?.person?.avatarUrl,
       })),
+  };
+}
+
+export function dtoAgentTagCandidate(row: {
+  id: number;
+  title: string;
+  districtId: number | null;
+  districtTitle: string | null;
+}): ApiAgentTagCandidate {
+  return {
+    id: Number(row.id),
+    title: row.title,
+    district: row.districtId
+      ? {
+          id: Number(row.districtId),
+          title: { de: row.districtTitle ?? undefined },
+        }
+      : null,
   };
 }

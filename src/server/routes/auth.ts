@@ -1,7 +1,7 @@
-import { FastifyJWT } from "@fastify/jwt";
-import { FastifyInstance, FastifyPluginOptions } from "fastify";
+import { FastifyInstance, FastifyPluginOptions, FastifyReply } from "fastify";
 import fp from "fastify-plugin";
 import { ApiAuthRefreshPost, ApiAuthRefreshResponse } from "need4deed-sdk";
+import { BadRequestError } from "../../config";
 import {
   ACCESS_LIFESPAN_MS,
   accessCookieName,
@@ -9,6 +9,7 @@ import {
   REFRESH_LIFESPAN_MS,
   refreshCookieName,
 } from "../../config/constants";
+import User from "../../data/entity/user.entity";
 import { hashPassword } from "../../data/utils";
 import logger from "../../logger";
 import { responseSchema } from "../schema";
@@ -24,8 +25,25 @@ import {
   userLoginSchema,
 } from "../schema/user.schema";
 import { ReplyMessage, RoutePrefix } from "../types";
+import {
+  createRefreshSession,
+  revokeRefreshSession,
+  revokeUserRefreshSessions,
+  rotateRefreshSession,
+} from "../utils/data/refresh-session";
 import { signAccessToken } from "../utils/data/sign-access-token";
 import { signRefreshToken } from "../utils/data/sign-refresh-token";
+import { createLoginIpCap, loginRateLimitKey } from "../utils/login-rate-limit";
+import {
+  getRefreshPayload,
+  getRefreshToken,
+  refreshRateLimitKey,
+} from "../utils/refresh-token";
+
+function clearAuthCookies(reply: FastifyReply) {
+  reply.clearCookie(accessCookieName, cookieOptions);
+  reply.clearCookie(refreshCookieName, cookieOptions);
+}
 
 async function authRoutes(
   fastify: FastifyInstance,
@@ -41,12 +59,22 @@ async function authRoutes(
     Reply: {
       message: string;
       data?: { access: string; refresh: string };
-      errors?: any;
+      errors?: string[];
     };
   }>(
     prefixedPath + RoutePrefix.LOGIN,
     {
-      config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
+      // Per account: behind the fe proxy all users can share one IP.
+      config: {
+        rateLimit: {
+          max: 10,
+          timeWindow: "1 minute",
+          hook: "preHandler",
+          keyGenerator: loginRateLimitKey,
+          onExceeded: () => logger.warn("Login failed: rate-limited-account"),
+        },
+      },
+      preHandler: createLoginIpCap(),
       schema: {
         body: userLoginSchema,
         response: {
@@ -56,12 +84,12 @@ async function authRoutes(
       },
     },
     async (request, reply) => {
-      reply.clearCookie(accessCookieName, cookieOptions);
-      reply.clearCookie(refreshCookieName, cookieOptions);
+      clearAuthCookies(reply);
 
       const { email, password } = request.body;
 
       if (!email || !password) {
+        logger.warn("Login failed: empty-field");
         return reply.status(400).send({ message: "Bad credentials." });
       }
 
@@ -75,14 +103,17 @@ async function authRoutes(
           where: { email },
         });
         if (!user) {
+          logger.warn("Login failed: unknown-email");
           return reply.status(404).send({ message: "User not found." });
         }
 
         if (!user.isActive) {
+          logger.warn(`Login failed for user ${user.id}: inactive`);
           return reply.status(403).send({ message: "User is not active." });
         }
 
         if (!(await user.checkPassword(password))) {
+          logger.warn(`Login failed for user ${user.id}: wrong-password`);
           return reply.status(401).send({ message: "Bad credentials." });
         }
 
@@ -92,7 +123,19 @@ async function authRoutes(
           throw new Error("No token generated.");
         }
 
-        const refresh = signRefreshToken(fastify, user);
+        const previous = getRefreshPayload(request);
+        if (previous) {
+          await revokeRefreshSession(
+            fastify.db.refreshSessionRepository.manager,
+            user.id,
+            previous.sid,
+          );
+        }
+        const session = await createRefreshSession(
+          fastify.db.refreshSessionRepository.manager,
+          user.id,
+        );
+        const refresh = signRefreshToken(fastify, user, session);
 
         if (!refresh) {
           throw new Error("No token generated.");
@@ -113,7 +156,7 @@ async function authRoutes(
           data: { access, refresh },
         });
       } catch (error) {
-        logger.error(`Authentication error: ${error.message}`);
+        logger.error(`Login failed: server-error: ${error.message}`);
         return reply.status(500).send({ message: "Internal server error." });
       }
     },
@@ -121,11 +164,17 @@ async function authRoutes(
 
   fastify.post<{
     Body: ApiAuthRefreshPost;
-    Reply: ApiAuthRefreshResponse | { message: string; errors?: any };
+    Reply: ApiAuthRefreshResponse | { message: string; errors?: string[] };
   }>(
     prefixedPath + RoutePrefix.REFRESH,
     {
-      config: { rateLimit: { max: 20, timeWindow: "1 minute" } },
+      config: {
+        rateLimit: {
+          max: 20,
+          timeWindow: "1 minute",
+          keyGenerator: refreshRateLimitKey,
+        },
+      },
       schema: {
         body: refreshAccessSchema,
         response: {
@@ -136,65 +185,60 @@ async function authRoutes(
     },
     async (request, reply) => {
       // verify if refresh token is provided and valid
-      let id: number;
-      let token: string;
+      if (!getRefreshToken(request)) {
+        throw new BadRequestError("Refresh token is required.");
+      }
+      const decoded = getRefreshPayload(request);
+      if (!decoded) {
+        clearAuthCookies(reply);
+        throw new BadRequestError("Invalid refresh token.");
+      }
+      const id = decoded.id;
 
-      if (request.body?.refresh) {
-        token = request.body.refresh;
-      } else if (request.cookies && request.cookies[refreshCookieName]) {
-        token = request.cookies[refreshCookieName];
+      const user = await fastify.db.userRepository.findOne({
+        where: { id },
+      });
+      if (!user) {
+        clearAuthCookies(reply);
+        return reply.status(404).send({ message: "User not found." });
       }
 
-      if (!token) {
-        return reply
-          .status(400)
-          .send({ message: "Refresh token is required." });
+      if (!user.isActive) {
+        clearAuthCookies(reply);
+        return reply.status(403).send({ message: "User is not active." });
+      }
+
+      const rotation = await rotateRefreshSession(
+        fastify.db.refreshSessionRepository.manager,
+        id,
+        decoded,
+      );
+      if (rotation.kind === "reuse") {
+        logger.warn(
+          `Refresh token reuse for user ${id}, session ${decoded.sid} revoked`,
+        );
+      }
+      if (rotation.kind === "grace") {
+        const secondsSinceRotation = Math.round(
+          (Date.now() - rotation.rotatedAt.getTime()) / 1000,
+        );
+        logger.info(
+          `Refresh grace for user ${id}, session ${decoded.sid}, ${secondsSinceRotation}s after rotation`,
+        );
+      }
+      if (rotation.kind === "reuse" || rotation.kind === "invalid") {
+        clearAuthCookies(reply);
+        throw new BadRequestError("Invalid refresh token.");
       }
 
       try {
-        const decoded = (await fastify.jwt.verify(
-          token,
-        )) as FastifyJWT["payload"] & {
-          id: number;
-        };
-        if (
-          !decoded ||
-          !(decoded.id && decoded.email) ||
-          decoded.type !== "refresh"
-        ) {
-          return reply.status(400).send({ message: "Invalid refresh token." });
-        }
-
-        id = decoded.id;
-      } catch (error) {
-        logger.error(`JWT verification failed: ${error.message}`);
-        return reply.status(400).send({ message: "Invalid refresh token." });
-      }
-
-      try {
-        const userRepository = fastify.db.userRepository;
-        if (!userRepository) {
-          throw new Error("User repository is not initialized.");
-        }
-
-        const user = await userRepository.findOne({
-          where: { id },
-        });
-        if (!user) {
-          return reply.status(404).send({ message: "User not found." });
-        }
-
-        if (!user.isActive) {
-          return reply.status(403).send({ message: "User is not active." });
-        }
-
         const access = signAccessToken(fastify, user);
 
         if (!access) {
           throw new Error("No token generated.");
         }
 
-        const refresh = signRefreshToken(fastify, user);
+        const refresh = signRefreshToken(fastify, user, rotation.ids);
 
         if (!refresh) {
           throw new Error("No token generated.");
@@ -228,13 +272,21 @@ async function authRoutes(
         },
       },
     },
-    async (_request, reply) => {
-      // Logout is open (no auth guard) so a stale/expired session can always
-      // clear its cookies. Clear the httpOnly auth cookies on the caller's
-      // browser using the same options they were set with (path/sameSite/secure)
-      // so the browser actually removes them.
-      reply.clearCookie(accessCookieName, cookieOptions);
-      reply.clearCookie(refreshCookieName, cookieOptions);
+    async (request, reply) => {
+      clearAuthCookies(reply);
+
+      const refresh = getRefreshPayload(request);
+      if (refresh) {
+        await revokeRefreshSession(
+          fastify.db.refreshSessionRepository.manager,
+          refresh.id,
+          refresh.sid,
+        ).catch((err) => {
+          logger.error(
+            `Failed to revoke refresh session on logout for user ${refresh.id}: ${err instanceof Error ? err.message : err}`,
+          );
+        });
+      }
 
       return reply.status(200).send({ message: "Logout successful." });
     },
@@ -308,10 +360,12 @@ async function authRoutes(
         return reply.status(400).send({ message: TOKEN_ERROR_MESSAGE });
       }
 
-      await fastify.db.userRepository.update(
-        { id: user.id },
-        { password: await hashPassword(newPassword) },
-      );
+      const hashed = await hashPassword(newPassword);
+      await fastify.db.userRepository.manager.transaction(async (tx) => {
+        await tx.update(User, { id: user.id }, { password: hashed });
+        await revokeUserRefreshSessions(tx, user.id);
+      });
+      logger.info(`Password set for user ${user.id} via reset-password`);
 
       return reply.status(200).send({
         message: "Password has been reset.",
@@ -342,10 +396,17 @@ async function authRoutes(
           .send({ message: "Current password is incorrect." });
       }
 
-      await fastify.db.userRepository.update(
-        { id: authUser.id },
-        { password: await hashPassword(newPassword) },
-      );
+      const hashed = await hashPassword(newPassword);
+      const refresh = getRefreshPayload(request);
+      await fastify.db.userRepository.manager.transaction(async (tx) => {
+        await tx.update(User, { id: authUser.id }, { password: hashed });
+        await revokeUserRefreshSessions(
+          tx,
+          authUser.id,
+          refresh?.id === authUser.id ? refresh.sid : undefined,
+        );
+      });
+      logger.info(`Password set for user ${authUser.id} via change-password`);
 
       return reply.status(200).send({
         message: "Password has been changed.",

@@ -8,12 +8,17 @@ import {
   UserRole,
   VolunteerPatchBodyData,
 } from "need4deed-sdk";
-import { FindOptionsOrder, FindOptionsWhere, In } from "typeorm";
-import { NotFoundError, UnauthorizedError } from "../../../config";
+import { FindOptionsOrder, In } from "typeorm";
+import {
+  BadRequestError,
+  NotFoundError,
+  UnauthorizedError,
+} from "../../../config";
 import { dataSource } from "../../../data/data-source";
 import Comment from "../../../data/entity/comment.entity";
 import Deal from "../../../data/entity/deal.entity";
 import Address from "../../../data/entity/location/address.entity";
+import Postcode from "../../../data/entity/location/postcode.entity";
 import DealActivity from "../../../data/entity/m2m/deal-activity";
 import DealDistrict from "../../../data/entity/m2m/deal-district";
 import DealLanguage from "../../../data/entity/m2m/deal-language";
@@ -40,23 +45,34 @@ import {
   VolunteerListType,
 } from "../../types";
 import {
+  andIntoWhere,
   buildEraseSummaryMessage,
+  createAddress,
   erasePersonPii,
   ErasePersonPiiSummary,
   fetchVolunteerById,
+  findAvailabilityDealIds,
   getLanguageCode,
   getOrCreateTimeslot,
   getSkipTake,
   getVolunteerPatchData,
   getVolunteerWhere,
+  isStaffRole,
   patchEntity,
   patchOrReplaceAddress,
+  resolveCommuteFilter,
   updateOptionList,
+  volunteerCommuteIdWhere,
 } from "../../utils";
+import { maskPii } from "../../utils/pii/mask";
 import {
-  maskForCaller,
+  resetCallerMask,
   resolveCallerMask,
 } from "../../utils/pii/pre-serialization";
+import {
+  assertVolunteerVisible,
+  resolveVolunteerVisibility,
+} from "../../utils/pii/volunteer-visibility";
 import volunteerAppreciationRoutes from "./appreciation.routes";
 import volunteerAuditLogRoutes from "./audit-log.routes";
 import volunteerCommunicationRoutes from "./communication.routes";
@@ -82,11 +98,6 @@ export default async function volunteerRoutes(
     "deal.dealDistrict.district",
   ];
 
-  // Relations the list view actually serializes (volunteerListSerializer):
-  // deal.postcode is unused, so it's omitted. The table view renders only
-  // languages + locations; the card view additionally renders activities,
-  // skills, availability, and — for the map tab's lat/lon pins (be#661) —
-  // person.address.postcode.
   const listRelationsCommon = [
     "person",
     "deal",
@@ -104,9 +115,13 @@ export default async function volunteerRoutes(
       ? listRelationsCommon
       : [...listRelationsCommon, ...listRelationsCardExtra];
 
-  // GETs open to any logged-in user (PII masked per role); writes stay
-  // COORDINATOR-only (re-gated per-route).
   fastify.addHook("onRequest", fastify.authenticate());
+  fastify.addHook("preHandler", async (request) => {
+    const { id } = (request.params ?? {}) as { id?: string };
+    if (id !== undefined && Number.isInteger(Number(id))) {
+      await assertVolunteerVisible(request, Number(id));
+    }
+  });
 
   await fastify.register(volunteerOpportunityRoutes, {
     prefix: RoutePrefix.OPPORTUNITY,
@@ -167,25 +182,19 @@ export default async function volunteerRoutes(
 
       const isoCode = getLanguageCode(request.query.language) || Lang.DE;
 
-      try {
-        const data = await fetchVolunteerById(
-          id,
-          isoCode,
-          relations,
-          await resolveCallerMask(request),
-        );
-        if (!data) {
-          logger.error(`Failed fetching volunteer (id=${id}).`);
-          throw new Error(`Volunteer (id=${id}) not found after patch.`);
-        }
-        return reply.status(200).send({
-          message: `Volunteer (id=${id}).`,
-          data,
-        });
-      } catch (error) {
-        logger.error(`Error fetching volunteer id=${id}: ${error}`);
-        return reply.status(500).send({ message: "Internal server error." });
+      const data = await fetchVolunteerById(
+        id,
+        isoCode,
+        relations,
+        await resolveCallerMask(request),
+      );
+      if (!data) {
+        throw new NotFoundError(`Volunteer (id:${id}) not found.`);
       }
+      return reply.status(200).send({
+        message: `Volunteer (id=${id}).`,
+        data,
+      });
     },
   );
 
@@ -228,16 +237,21 @@ export default async function volunteerRoutes(
       );
       const [skip, take] = getSkipTake({ page, limit });
 
-      const where = getVolunteerWhere(filter) as FindOptionsWhere<Volunteer>;
+      const [visibility, availabilityDealIds, commute] = await Promise.all([
+        resolveVolunteerVisibility(request),
+        findAvailabilityDealIds(filter?.availability),
+        resolveCommuteFilter(filter),
+      ]);
+      const where = getVolunteerWhere(filter, visibility, availabilityDealIds);
+      if (commute) {
+        andIntoWhere(where, "id", volunteerCommuteIdWhere(commute));
+      }
       const order: FindOptionsOrder<Volunteer> = {
         id: sortOrder === SortOrder.OldToNew ? "ASC" : "DESC",
       };
 
       const volunteerRepository = fastify.db.volunteerRepository;
 
-      // Step 1: page the volunteer ids + total count without hydrating any
-      // collection. TypeORM auto-joins only the relations the filter touches,
-      // so the COUNT no longer runs over a 5-way cartesian join.
       const [idRows, count] = await volunteerRepository.findAndCount({
         where,
         select: { id: true },
@@ -247,8 +261,6 @@ export default async function volunteerRoutes(
       });
       const ids = idRows.map((v) => v.id);
 
-      // Step 2: load just this page's entities, fetching collections via the
-      // "query" strategy (one query per relation) to avoid a cartesian blow-up.
       const volunteers = ids.length
         ? await volunteerRepository.find({
             where: { id: In(ids) },
@@ -258,7 +270,9 @@ export default async function volunteerRoutes(
           })
         : [];
 
-      await maskForCaller(request, volunteers);
+      if (visibility) {
+        maskPii(volunteers, visibility);
+      }
       const data = volunteers.map(volunteerListSerializer).filter(Boolean);
 
       reply.status(200).send({
@@ -282,10 +296,6 @@ export default async function volunteerRoutes(
   }>(
     "/:id",
     {
-      // COORDINATOR/ADMIN may patch any volunteer; a VOLUNTEER may only
-      // patch their own profile (checked below, once the target volunteer's
-      // personId is known — `allowSelf` doesn't apply here since it compares
-      // against the User id, not this route's Volunteer id).
       schema: {
         params: idParamSchema,
         querystring: langQuerySchema,
@@ -321,7 +331,7 @@ export default async function volunteerRoutes(
         request.authUser?.personId !== undefined &&
         request.authUser?.personId !== null &&
         request.authUser.personId === volunteer.personId;
-      if (role !== UserRole.COORDINATOR && role !== UserRole.ADMIN && !isSelf) {
+      if (!isStaffRole(role) && !isSelf) {
         throw new UnauthorizedError();
       }
 
@@ -337,10 +347,6 @@ export default async function volunteerRoutes(
         locations,
       } = getVolunteerPatchData(request.body, ["dateReturn"]);
 
-      // A volunteer editing their own profile may only touch contact details
-      // and preferences (fe#1001) — an explicit allowlist rather than a
-      // denylist of "internal" fields, so a new coordinator-owned Volunteer
-      // column is safe-by-default instead of accidentally self-editable.
       const SELF_EDITABLE_VOLUNTEER_FIELDS = new Set<keyof Volunteer>([
         "infoAbout",
         "infoExperience",
@@ -358,40 +364,65 @@ export default async function volunteerRoutes(
             SELF_EDITABLE_VOLUNTEER_FIELDS.has(key as keyof Volunteer),
           ),
         ) as typeof patchedVolunteerData;
-        // Mirror getVolunteerPatchData's own empty-object-becomes-undefined
-        // convention (getEmptyPropsNull) so an all-restricted-fields
-        // self-edit request cleanly no-ops instead of hitting patchEntity
-        // with `{}`.
         volunteerData = Object.keys(filtered).length ? filtered : undefined;
       }
 
-      // personData/addressData/postcodeData carry ids straight from the
-      // request body (be#965 review) — a self-edit must never trust those:
-      // patchEntity falls back to `data.id` when patching, so an
-      // unauthorized body-supplied id would let a volunteer overwrite any
-      // other person's or address's row. For isSelf, force personData.id to
-      // the caller's own Person, and addressData.id to that Person's own
-      // (already-existing) Address, dropping the address patch entirely
-      // otherwise rather than trusting the body's id.
-      let personData = patchedPersonData;
-      let addressData = patchedAddressData;
-      if (isSelf) {
-        if (personData) {
-          personData = { ...personData, id: volunteer.personId };
+      const { ownerAgentId } = request.body;
+      if (
+        ownerAgentId !== undefined &&
+        ownerAgentId !== volunteer.ownerAgentId
+      ) {
+        if (role !== UserRole.ADMIN) {
+          throw new UnauthorizedError();
         }
-        if (addressData) {
-          const ownPerson = await fastify.db.personRepository.findOneBy({
-            id: volunteer.personId,
-          });
-          addressData = ownPerson?.addressId
-            ? { ...addressData, id: ownPerson.addressId }
-            : undefined;
+        if (
+          ownerAgentId !== null &&
+          !(await fastify.db.agentRepository.existsBy({ id: ownerAgentId }))
+        ) {
+          throw new BadRequestError(`Agent (id:${ownerAgentId}) not found.`);
         }
+        volunteerData = { ...volunteerData, ownerAgentId };
       }
 
-      // Captured before any writes, for the audit-trail diff below (be#919)
-      // — patchEntity only performs the UPDATE, it doesn't hand back what
-      // the row looked like beforehand.
+      const personData = patchedPersonData
+        ? { ...patchedPersonData, id: volunteer.personId }
+        : undefined;
+      const ownPerson = await fastify.db.personRepository.findOne({
+        where: { id: volunteer.personId },
+        relations: ["address"],
+      });
+
+      const addressFields = Object.fromEntries(
+        Object.entries(patchedAddressData ?? {}).filter(
+          ([key, value]) => key !== "id" && value !== "",
+        ),
+      ) as Partial<Address>;
+      const sendsPostcode = Boolean(postcodeData?.id || postcodeData?.value);
+      let addressData: Partial<Address> | undefined;
+      let resolvedPostcode: Partial<Postcode> | undefined;
+      if (Object.keys(addressFields).length || sendsPostcode) {
+        if (sendsPostcode) {
+          const postcode = await fastify.db.postcodeRepository.findOneBy(
+            postcodeData?.id
+              ? { id: Number(postcodeData.id) }
+              : { value: postcodeData?.value },
+          );
+          if (!postcode) {
+            throw new BadRequestError("Address not saved: unknown postcode.");
+          }
+          resolvedPostcode = { id: postcode.id };
+        }
+        if (!ownPerson?.addressId && !resolvedPostcode) {
+          throw new BadRequestError(
+            "Address not saved: a postcode is required.",
+          );
+        }
+        addressData = {
+          ...addressFields,
+          id: ownPerson?.addressId ?? undefined,
+        };
+      }
+
       const auditLogEntries: Partial<VolunteerAuditLog>[] = [];
       if (
         volunteerData?.statusEngagement !== undefined &&
@@ -403,24 +434,21 @@ export default async function volunteerRoutes(
         });
       }
       let hasContactChange = false;
-      if ((personData && personData.id) || (addressData && addressData.id)) {
-        const prevPerson = await fastify.db.personRepository.findOne({
-          where: { id: (personData?.id ?? volunteer.personId) as number },
-          relations: ["address"],
-        });
-        if (personData) {
-          hasContactChange ||= Object.entries(personData).some(
-            ([key, value]) =>
-              key !== "id" && prevPerson?.[key as keyof Person] !== value,
-          );
-        }
-        if (addressData) {
-          hasContactChange ||= Object.entries(addressData).some(
+      if (personData) {
+        hasContactChange ||= Object.entries(personData).some(
+          ([key, value]) =>
+            key !== "id" && ownPerson?.[key as keyof Person] !== value,
+        );
+      }
+      if (addressData) {
+        hasContactChange ||=
+          Object.entries(addressData).some(
             ([key, value]) =>
               key !== "id" &&
-              prevPerson?.address?.[key as keyof Address] !== value,
-          );
-        }
+              ownPerson?.address?.[key as keyof Address] !== value,
+          ) ||
+          (resolvedPostcode !== undefined &&
+            resolvedPostcode.id !== ownPerson?.address?.postcodeId);
       }
       if (hasContactChange) {
         auditLogEntries.push({
@@ -439,7 +467,7 @@ export default async function volunteerRoutes(
           }
         }
 
-        if (personData && personData.id) {
+        if (personData) {
           const success = await patchEntity(Person, personData);
           if (!success) {
             return reply.status(400).send({
@@ -448,17 +476,30 @@ export default async function volunteerRoutes(
           }
         }
 
-        if (addressData && addressData.id) {
+        if (addressData?.id) {
           const success = await patchOrReplaceAddress(
-            personData?.id ?? volunteer.personId,
+            volunteer.personId,
             addressData as Partial<Address> & { id: number },
-            postcodeData,
+            resolvedPostcode ?? {},
           );
           if (!success) {
             return reply.status(400).send({
               message: `Address (id=${addressData.id}) not updated.`,
             });
           }
+        } else if (addressData) {
+          const { id: _id, ...newAddress } = addressData;
+          const address = await createAddress(
+            newAddress,
+            resolvedPostcode ?? {},
+          );
+          if (!address) {
+            throw new BadRequestError("Address not saved: unknown postcode.");
+          }
+          await fastify.db.personRepository.update(
+            { id: volunteer.personId },
+            { addressId: address.id },
+          );
         }
 
         if (languages) {
@@ -529,7 +570,6 @@ export default async function volunteerRoutes(
           }
         }
       } catch (error) {
-        // The global error handler picks the status (BaseError, 404, 409, ...).
         logger.error(`Error patching volunteer data (id=${dealId}): ${error}`);
         throw error;
       }
@@ -550,6 +590,7 @@ export default async function volunteerRoutes(
       }
 
       const isoCode = getLanguageCode(request.query.language) || Lang.DE;
+      resetCallerMask(request);
 
       try {
         const data = await fetchVolunteerById(
@@ -573,12 +614,6 @@ export default async function volunteerRoutes(
     },
   );
 
-  // COORDINATOR-only, hard delete. OpportunityVolunteer, Document,
-  // Communication, and Appreciation rows all cascade via FK. Comment rows are
-  // polymorphic (entityType/entityId, no real FK) so they're cleaned up
-  // explicitly here; Deal is exclusively owned by one volunteer (minted fresh
-  // at creation), so it's deleted alongside rather than left as a permanent
-  // orphan.
   fastify.delete<{ Params: ParamsId; Reply: ReplyMessage }>(
     "/:id",
     {
@@ -599,20 +634,12 @@ export default async function volunteerRoutes(
 
       const { dealId, personId } = volunteer;
 
-      // OpportunityVolunteer rows cascade at the DB level, which bypasses
-      // TypeORM's @AfterRemove hook (it never loads/removes those entities
-      // via the entity manager) — so each linked opportunity's statusMatch
-      // must be recomputed explicitly, or it's left stale indefinitely.
       const linkedOpportunityIds = (
         await fastify.db.opportunityVolunteerRepository.find({
           where: { volunteerId: id },
         })
       ).map((ov) => ov.opportunityId);
 
-      // GDPR Art. 17 (be#727): deleting the volunteer profile alone leaves
-      // the underlying Person's PII (and their User login, if any) fully
-      // intact — anonymize it in the same transaction. personId is optional
-      // on Volunteer, so a profile with none skips this entirely.
       let eraseSummary: ErasePersonPiiSummary | undefined;
 
       await dataSource.manager.transaction(async (manager) => {

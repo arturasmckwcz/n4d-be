@@ -1,5 +1,6 @@
 import { FastifyInstance, FastifyPluginOptions } from "fastify";
 import { ApiVolunteerOpportunityGetList } from "need4deed-sdk";
+import Opportunity from "../../../data/entity/opportunity/opportunity.entity";
 import { dtoVolunteerOpportunityGetList } from "../../../services/dto/dto-opportunity";
 import {
   responseSchema,
@@ -11,8 +12,10 @@ import {
 } from "../../types";
 import {
   getCategoryToDealHandler,
+  getOpportunityListWhere,
   getSkipTake,
-  normalizeStringArrayInput,
+  mergeIntoWhere,
+  updateBackfilledColumn,
 } from "../../utils";
 import {
   requestLanguage,
@@ -41,19 +44,20 @@ export default async function volunteerOpportunityRoutes(
         "deal.dealActivity.activity",
         "deal.dealDistrict.district",
         "deal.dealTimeslot.timeslot",
+        "deal.postcode",
       ];
 
-      // `language` picks the response language (be#1068); everything else
-      // is a column filter.
-      const { page, limit, language, ...filters } = request.query;
+      const { page, limit, language, agentId, ...filter } = request.query;
 
       const [skip, take] = getSkipTake({ page, limit });
 
-      const where = Object.fromEntries(
-        Object.entries(filters as QuerystringVolunteerOpportunityGetList).map(
-          ([key, value]) => [key, normalizeStringArrayInput(value)],
-        ),
+      const where = await getOpportunityListWhere(
+        filter,
+        requestLanguage({ language }),
       );
+      if (agentId) {
+        mergeIntoWhere<Opportunity>(where, { agentId });
+      }
 
       const opportunityRepository = fastify.db.opportunityRepository;
 
@@ -70,12 +74,12 @@ export default async function volunteerOpportunityRoutes(
         return opportunity;
       });
 
-      if (updates.length > 0) {
-        const dealRepository = fastify.db.dealRepository;
-        await dealRepository.save(updates);
-      }
+      await updateBackfilledColumn(
+        fastify.db.dealRepository,
+        updates,
+        "categoryId",
+      );
 
-      // Before PII masking, after any save of these entities (be#1068).
       await translateOpportunities(
         fastify,
         opportunitiesCategory,

@@ -1,15 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
 import logger from "../../../logger";
-import { ValidatingEmailTransport } from "../../../services/notify/transports/validating";
+import {
+  SuspendedEmailError,
+  ValidatingEmailTransport,
+} from "../../../services/notify/transports/validating";
 import type { EmailTransport } from "../../../services/notify/types";
 
-function buildTransports() {
+function buildTransports(rejectSuspended = false) {
   const deliverable: EmailTransport = { send: vi.fn() };
   const errorTransport: EmailTransport = { send: vi.fn() };
   const transport = new ValidatingEmailTransport(
     deliverable,
     errorTransport,
     "dev@need4deed.org",
+    rejectSuspended,
   );
   return { deliverable, errorTransport, transport };
 }
@@ -55,6 +59,39 @@ describe("ValidatingEmailTransport", () => {
     expect(report.text).toContain("some body");
   });
 
+  it("reports reply-to and attachment names", async () => {
+    const { errorTransport, transport } = buildTransports();
+
+    await transport.send({
+      to: "person@example.com",
+      replyTo: ["cora@example.com", "team@example.com"],
+      subject: "",
+      text: "x",
+      attachments: [
+        {
+          filename: "form.pdf",
+          content: Buffer.from("%PDF"),
+          contentType: "application/pdf",
+        },
+      ],
+    });
+
+    const report = vi.mocked(errorTransport.send).mock.calls[0][0];
+    expect(report.text).toContain(
+      "Reply-To: cora@example.com, team@example.com",
+    );
+    expect(report.text).toContain("Attachments: form.pdf");
+  });
+
+  it("still rejects with the problems when the report itself fails", async () => {
+    const { errorTransport, transport } = buildTransports(true);
+    vi.mocked(errorTransport.send).mockRejectedValue(new Error("smtp down"));
+
+    await expect(
+      transport.send({ to: "person@example.com", subject: "", text: "x" }),
+    ).rejects.toBeInstanceOf(SuspendedEmailError);
+  });
+
   it("reports a blank subject with a placeholder fallback in the report subject line", async () => {
     const { errorTransport, transport } = buildTransports();
 
@@ -83,6 +120,24 @@ describe("ValidatingEmailTransport", () => {
       expect(logged).toContain("subject has an unresolved placeholder");
       expect(logged).not.toContain("vera-at-example.com");
       expect(logged).not.toContain("Begleitung");
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("with rejectSuspended, reports and then throws a SuspendedEmailError", async () => {
+    const { deliverable, errorTransport, transport } = buildTransports(true);
+    const error = vi.spyOn(logger, "error").mockImplementation(() => logger);
+    try {
+      const sent = transport.send({
+        to: "not-an-address",
+        subject: "Hello",
+        text: "A valid body.",
+      });
+
+      await expect(sent).rejects.toBeInstanceOf(SuspendedEmailError);
+      expect(errorTransport.send).toHaveBeenCalledTimes(1);
+      expect(deliverable.send).not.toHaveBeenCalled();
     } finally {
       error.mockRestore();
     }

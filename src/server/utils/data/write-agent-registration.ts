@@ -2,10 +2,12 @@ import {
   AgentEngagementStatusType,
   AgentMembershipStatus,
   AgentRoleType,
+  ApiAgentAddressConflict,
+  ApiAgentAlreadyRegisteredConflict,
   ApiAgentRegisterNew,
 } from "need4deed-sdk";
-import { EntityManager } from "typeorm";
-import { BaseError, NotFoundError, UnauthorizedError } from "../../../config";
+import { DataSource, EntityManager, In } from "typeorm";
+import { BadRequestError, BaseError, NotFoundError } from "../../../config";
 import { dataSource } from "../../../data/data-source";
 import Postcode from "../../../data/entity/location/postcode.entity";
 import AgentLanguage from "../../../data/entity/m2m/agent-language";
@@ -13,36 +15,55 @@ import AgentPerson from "../../../data/entity/m2m/agent-person";
 import AgentService from "../../../data/entity/m2m/agent-service";
 import Agent from "../../../data/entity/opportunity/agent.entity";
 import Person from "../../../data/entity/person.entity";
+import logger from "../../../logger";
 import { syncAgentDistrictFromPostcode } from "./add-district-to-agent";
+import { claimAgent } from "./claim-agent";
 import { createAddress } from "./for-routes";
+import { isFreeEmailDomain } from "./free-email-domains";
 import { getAgentByAddress } from "./get-agent-by-postcode";
 import { isAgentDomainAllowed } from "./is-agent-domain-allowed";
+import { isEmailDomainTrusted } from "./is-trusted-domain";
 
 export interface RegisterAgentResult {
   agentId: number;
   membershipStatus: AgentMembershipStatus;
 }
 
-/**
- * Raised by createAgentForPerson when the street+postcode already match an
- * existing agent (via the same getAgentByAddress picker POST /opportunity/legacy
- * uses). The route maps it to a 409 + agentId so the client can offer JOIN.
- */
 export class AgentAddressConflictError extends BaseError {
-  constructor(public readonly agentId: number) {
-    super("An agent at this address already exists.", 409, true, {
+  constructor(
+    public readonly agentId: number,
+    agentTitle?: string,
+  ) {
+    const details: ApiAgentAddressConflict = {
       conflict: "address",
       agentId,
+      ...(agentTitle ? { agentTitle } : {}),
+    };
+    super("An agent at this address already exists.", 409, true, {
+      ...details,
     });
   }
 }
 
-/**
- * Raised by createAgent (coordinator/admin bare-create, fe#911) on a
- * unique-title violation. Mirrors AgentAddressConflictError's response shape
- * so the route can let it propagate to the global error handler instead of
- * hand-building the 409 body itself.
- */
+export class AgentAlreadyRegisteredError extends BaseError {
+  constructor(
+    public readonly agentId: number,
+    public readonly membershipStatus: AgentMembershipStatus,
+  ) {
+    const details: ApiAgentAlreadyRegisteredConflict = {
+      conflict: "registered",
+      agentId,
+      membershipStatus,
+    };
+    super(
+      "Agent registration already completed or awaiting approval.",
+      409,
+      true,
+      { ...details },
+    );
+  }
+}
+
 export class AgentTitleConflictError extends BaseError {
   constructor(public readonly agentId?: number) {
     super("An agent with this title already exists.", 409, true, {
@@ -52,30 +73,92 @@ export class AgentTitleConflictError extends BaseError {
   }
 }
 
-// Dedup: if the street+postcode already resolve to an existing agent (same
-// picker POST /opportunity/legacy uses), don't mint a duplicate — surface it
-// so the caller can offer JOIN (self-registration) or just point at the
-// existing agent (coordinator create) instead.
-async function assertNoAddressConflict(
-  addressStreet?: string,
-  addressPostcode?: string,
+export async function findRegistrationMembership(
+  personId: number,
+  {
+    manager = dataSource,
+    relations = [],
+  }: { manager?: DataSource | EntityManager; relations?: string[] } = {},
+): Promise<AgentPerson | null> {
+  const memberships = await manager.getRepository(AgentPerson).find({
+    where: { personId, role: AgentRoleType.VOLUNTEER_COORDINATOR },
+    relations,
+    order: { id: "ASC" },
+  });
+  return (
+    memberships.find((m) => m.status === AgentMembershipStatus.ACTIVE) ??
+    memberships[0] ??
+    null
+  );
+}
+
+// Serializes concurrent submissions so they can't both pass the check.
+export async function lockRegistration(
+  personId: number,
+  manager: EntityManager,
 ): Promise<void> {
-  if (!addressStreet || !addressPostcode) {
+  await manager.query(
+    "SELECT pg_advisory_xact_lock(hashtext('agent-register'), $1)",
+    [personId],
+  );
+}
+
+async function assertNotRegistered(
+  personId: number,
+  manager: EntityManager,
+): Promise<void> {
+  await lockRegistration(personId, manager);
+  const membership = await findRegistrationMembership(personId, { manager });
+  if (membership) {
+    throw new AgentAlreadyRegisteredError(
+      membership.agentId,
+      membership.status,
+    );
+  }
+}
+
+// Only registrants who would join as ACTIVE may learn the NGO's name — the
+// same rule as the registration search.
+async function getTitleVisibleToRegistrant(
+  agent: Agent,
+  registrantEmail: string | undefined,
+  manager: DataSource | EntityManager,
+): Promise<string | undefined> {
+  if (!registrantEmail || agent.unclaimed) {
+    return undefined;
+  }
+  try {
+    const status = await resolveJoinStatus(agent.id, registrantEmail, manager);
+    return status === AgentMembershipStatus.ACTIVE ? agent.title : undefined;
+  } catch (error) {
+    // Never turn the 409 into a 500; the conflict just goes out unnamed.
+    logger.warn(
+      `register-agent: conflict title lookup failed for agent ${agent.id}: ${error}`,
+    );
+    return undefined;
+  }
+}
+
+async function assertNoAddressConflict(
+  { addressStreet, addressPostcode, confirmSharedAddress }: ApiAgentRegisterNew,
+  manager: DataSource | EntityManager = dataSource,
+  registrantEmail?: string,
+): Promise<void> {
+  if (confirmSharedAddress || !addressStreet || !addressPostcode) {
     return;
   }
-  const agents = await dataSource.getRepository(Agent).find({
+  const agents = await manager.getRepository(Agent).find({
     relations: ["address.postcode", "agentPostcode.postcode"],
   });
   const match = getAgentByAddress(agents, addressStreet, addressPostcode);
   if (match) {
-    throw new AgentAddressConflictError(match.id);
+    throw new AgentAddressConflictError(
+      match.id,
+      await getTitleVisibleToRegistrant(match, registrantEmail, manager),
+    );
   }
 }
 
-// The Agent + Address + AgentService + AgentLanguage rows shared by both the
-// self-registration CREATE path and the coordinator-created (personless)
-// path — everything except the AgentPerson membership itself, which only the
-// former needs.
 async function createBareAgent(
   input: ApiAgentRegisterNew,
   manager: EntityManager,
@@ -92,20 +175,18 @@ async function createBareAgent(
 
   const newAgent = new Agent({
     title: input.title,
+    organizationId: input.organizationId,
     agentTypeId: input.typeId ?? undefined,
     info: input.info ?? undefined,
     website: input.website ?? undefined,
     addressId: address?.id,
     unclaimed,
   });
-  // District is derived from the postcode, never taken from the client — the
-  // same rule PATCH /agent/:id enforces (be#827, be#1059). A postcode with
-  // no street (allowed by the coordinator create form) creates no Address,
-  // but still determines the district.
   if (address || input.addressPostcode) {
     await syncAgentDistrictFromPostcode(
       newAgent,
       address?.postcodeId ?? ({ value: input.addressPostcode } as Postcode),
+      manager,
     );
   }
   const agent = await manager.getRepository(Agent).save(newAgent);
@@ -133,30 +214,19 @@ async function createBareAgent(
   return agent;
 }
 
-/**
- * CREATE path: a verified user creates a brand-new agent and becomes its first
- * VOLUNTEER_COORDINATOR. The creator owns the record, so the membership is
- * ACTIVE immediately. Persisted in one transaction:
- *   1. Agent (with optional Address resolved from street + postcode)
- *   2. AgentPerson linking the registrant's Person as VOLUNTEER_COORDINATOR
- *   3. AgentLanguage rows for the selected language ids
- *
- * The user + person already exist (created via POST /user + email verification);
- * this only writes agent-side records. A unique-title violation bubbles up for
- * the route to convert into a 409 + join suggestion.
- */
 type AgentRegisterInput = ApiAgentRegisterNew & { phone?: string };
 
 export async function createAgentForPerson(
   personId: number,
   input: AgentRegisterInput,
+  registrantEmail?: string,
 ): Promise<RegisterAgentResult> {
-  await assertNoAddressConflict(input.addressStreet, input.addressPostcode);
-
   let result!: RegisterAgentResult;
 
   try {
     await dataSource.manager.transaction(async (manager) => {
+      await assertNotRegistered(personId, manager);
+      await assertNoAddressConflict(input, manager, registrantEmail);
       const agent = await createBareAgent(input, manager);
 
       await manager.getRepository(AgentPerson).save(
@@ -180,29 +250,16 @@ export async function createAgentForPerson(
       };
     });
   } catch (err) {
-    if (classifyRegisterAgentConflict(err) === "title") {
-      const existing = await dataSource
-        .getRepository(Agent)
-        .findOne({ where: { title: input.title } });
-      throw new AgentTitleConflictError(existing?.id);
-    }
-    throw err;
+    throw await toRegisterAgentError(err, input);
   }
 
   return result;
 }
 
-/**
- * COORDINATOR/ADMIN create path (fe#911, be side): an Agent with no linked
- * Person/User at all — for adding an NGO the coordinator already has details
- * for, before it has self-registered. Shares createBareAgent with
- * createAgentForPerson; the only difference is there's no AgentPerson
- * membership (and thus no phone-on-Person write) to add.
- */
 export async function createAgent(
   input: ApiAgentRegisterNew,
 ): Promise<{ agentId: number }> {
-  await assertNoAddressConflict(input.addressStreet, input.addressPostcode);
+  await assertNoAddressConflict(input);
 
   let agentId!: number;
 
@@ -212,102 +269,99 @@ export async function createAgent(
       agentId = agent.id;
     });
   } catch (err) {
-    if (classifyRegisterAgentConflict(err) === "title") {
-      const existing = await dataSource
-        .getRepository(Agent)
-        .findOne({ where: { title: input.title } });
-      throw new AgentTitleConflictError(existing?.id);
-    }
-    throw err;
+    throw await toRegisterAgentError(err, input);
   }
 
   return { agentId };
 }
 
-/**
- * Resolve whether a join may be auto-approved. Mirrors the POST /opportunity/legacy
- * authorization: the registrant's email domain must already belong to the agent
- * (i.e. an existing member shares the domain). Registrant emails are already
- * restricted to allowlisted RAC domains, so a domain match is a strong "same
- * org" signal. No match -> PENDING, surfaced to an ADMIN/COORDINATOR.
- *
- * Per member the match uses Person.email, falling back to the linked User
- * email(s) when the Person has none (Person.email is often unset, but the User
- * always has one).
- */
 export async function resolveJoinStatus(
   agentId: number,
   registrantEmail: string,
+  manager: DataSource | EntityManager = dataSource,
 ): Promise<AgentMembershipStatus> {
+  const agent = await manager.getRepository(Agent).findOne({
+    select: { id: true, engagementStatus: true },
+    where: { id: agentId },
+  });
+  if (agent?.engagementStatus === AgentEngagementStatusType.INACTIVE) {
+    return AgentMembershipStatus.PENDING;
+  }
+
   const allowed = await isAgentDomainAllowed(
     registrantEmail,
     async (domain) => {
-      const suffix = `@${domain}`;
-      const members = await dataSource.getRepository(AgentPerson).find({
-        where: { agentId },
+      const members = await manager.getRepository(AgentPerson).find({
+        where: { agentId, status: AgentMembershipStatus.ACTIVE },
         relations: ["person", "person.users"],
       });
-      return members.some((member) => {
-        const personEmail = member.person?.email;
-        if (personEmail) {
-          return personEmail.toLowerCase().endsWith(suffix);
-        }
-        return (member.person?.users ?? []).some((user) =>
-          user.email?.toLowerCase().endsWith(suffix),
-        );
-      });
+      return members.some((member) => isMemberOnDomain(member, domain));
     },
+    manager,
   );
 
   return allowed ? AgentMembershipStatus.ACTIVE : AgentMembershipStatus.PENDING;
 }
 
-/**
- * JOIN path: link a verified user's Person to an existing agent. Idempotent —
- * an existing link for the same (agent, person, role) is returned as-is rather
- * than duplicated. Status is decided by the caller via resolveJoinStatus.
- */
+// Only ACTIVE members count: a PENDING row is an unreviewed join request, and
+// counting it would let a registrant vouch for their own domain (be#1041).
+function isMemberOnDomain(member: AgentPerson, domain: string): boolean {
+  const suffix = `@${domain}`;
+  const personEmail = member.person?.email;
+  if (personEmail) {
+    return personEmail.toLowerCase().endsWith(suffix);
+  }
+  return (member.person?.users ?? []).some((user) =>
+    user.email?.toLowerCase().endsWith(suffix),
+  );
+}
+
+// Batch form of resolveJoinStatus's domain check, for callers that already
+// filtered out unclaimed/INACTIVE agents: which of agentIds would the
+// registrant JOIN as ACTIVE.
+export async function getAgentIdsJoinableAsActive(
+  registrantEmail: string,
+  agentIds: number[],
+): Promise<Set<number>> {
+  const domain = (registrantEmail || "").split("@").pop()?.toLowerCase();
+  if (!domain || agentIds.length === 0) {
+    return new Set();
+  }
+  if (await isEmailDomainTrusted(registrantEmail)) {
+    return new Set(agentIds);
+  }
+  if (isFreeEmailDomain(domain)) {
+    return new Set();
+  }
+
+  const members = await dataSource.getRepository(AgentPerson).find({
+    where: { agentId: In(agentIds), status: AgentMembershipStatus.ACTIVE },
+    relations: ["person", "person.users"],
+  });
+  return new Set(
+    members
+      .filter((member) => isMemberOnDomain(member, domain))
+      .map((member) => member.agentId),
+  );
+}
+
 export async function joinAgent(
   personId: number,
   agentId: number,
-  status: AgentMembershipStatus,
+  registrantEmail: string,
 ): Promise<RegisterAgentResult> {
-  const repo = dataSource.getRepository(AgentPerson);
-  const agentRepo = dataSource.getRepository(Agent);
+  let status!: AgentMembershipStatus;
 
-  // A coordinator-created agent (fe#911) is marked `unclaimed` until a real
-  // registration claims it — that claim must go through a future,
-  // explicitly-reviewed flow, not this auto-approve-on-domain-match JOIN.
-  // Excluding it from the /search picker isn't enough on its own: this route
-  // takes agentId directly from the client, so anyone who already has (or
-  // guesses) the id could otherwise join straight past that picker. Gating on
-  // this flag rather than "zero AgentPerson rows" matters: pre-existing
-  // legacy agents (created via POST /opportunity/legacy with no rac_email)
-  // can also have zero AgentPerson rows and must remain joinable.
-  const agent = await agentRepo.findOne({ where: { id: agentId } });
-  if (!agent) {
-    throw new NotFoundError(`Agent (id:${agentId}) not found.`);
-  }
-  if (agent.unclaimed) {
-    throw new UnauthorizedError(
-      "This agent has not been claimed yet and cannot be joined directly.",
-    );
-  }
-  // An INACTIVE agent (be#885) isn't offered by the /search picker either,
-  // for the same reason: a new registrant shouldn't be routed toward an NGO
-  // that's been marked inactive. Same bypass risk as unclaimed above — this
-  // route takes agentId directly from the client, so the /search exclusion
-  // alone doesn't stop a direct join.
-  if (agent.engagementStatus === AgentEngagementStatusType.INACTIVE) {
-    throw new UnauthorizedError("This agent is inactive and cannot be joined.");
-  }
-
-  const existing = await repo.findOne({
-    where: { agentId, personId, role: AgentRoleType.VOLUNTEER_COORDINATOR },
-  });
-
-  if (!existing) {
-    await repo.save(
+  await dataSource.manager.transaction(async (manager) => {
+    await assertNotRegistered(personId, manager);
+    const agent = await manager
+      .getRepository(Agent)
+      .findOne({ select: { id: true }, where: { id: agentId } });
+    if (!agent) {
+      throw new NotFoundError(`Agent (id:${agentId}) not found.`);
+    }
+    status = await resolveJoinStatus(agentId, registrantEmail, manager);
+    await manager.getRepository(AgentPerson).save(
       new AgentPerson({
         agentId,
         personId,
@@ -315,20 +369,46 @@ export async function joinAgent(
         status,
       }),
     );
-  }
+    if (status === AgentMembershipStatus.ACTIVE) {
+      await claimAgent(agentId, manager);
+    }
+  });
 
-  return { agentId, membershipStatus: existing?.status ?? status };
+  return { agentId, membershipStatus: status };
 }
 
-/**
- * Maps a Postgres unique-violation on agent.title to a small shape the route
- * can use to return a 409 + the existing agent id (so the client can offer to
- * JOIN instead of minting a duplicate), without leaking the raw error.
- */
-export function classifyRegisterAgentConflict(err: unknown): "title" | null {
+async function toRegisterAgentError(
+  err: unknown,
+  input: ApiAgentRegisterNew,
+): Promise<unknown> {
+  switch (classifyRegisterAgentConflict(err)) {
+    case "title": {
+      const existing = await dataSource
+        .getRepository(Agent)
+        .findOne({ where: { title: input.title } });
+      return new AgentTitleConflictError(existing?.id);
+    }
+    case "organization":
+      return new BadRequestError(
+        `Organization (id:${input.organizationId}) not found.`,
+      );
+    default:
+      return err;
+  }
+}
+
+export function classifyRegisterAgentConflict(
+  err: unknown,
+): "title" | "organization" | null {
   const e = err as { code?: string; detail?: string };
-  if (e?.code !== "23505" || !e.detail) {
+  if (!e?.detail) {
     return null;
   }
-  return e.detail.includes("title") ? "title" : null;
+  if (e.code === "23505" && e.detail.includes("title")) {
+    return "title";
+  }
+  if (e.code === "23503" && e.detail.includes("organization_id")) {
+    return "organization";
+  }
+  return null;
 }

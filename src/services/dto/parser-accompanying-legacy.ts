@@ -1,10 +1,9 @@
 import { OpportunityLegacyFormData, TranslatedIntoType } from "need4deed-sdk";
+import { berlinTimeZone } from "../../config";
 import Accompanying from "../../data/entity/opportunity/accompanying.entity";
 import { getPostcode } from "../../data/utils";
 
-// Parses a datetime string as Europe/Berlin time when no timezone is specified.
-// Uses the Intl API so DST transitions (CET⇔CEST) are handled automatically.
-export function parseAccompDatetime(value: string | undefined): Date {
+export function parseBerlinDatetime(value: string | undefined): Date {
   if (!value) {
     return new Date(NaN);
   }
@@ -17,8 +16,13 @@ export function parseAccompDatetime(value: string | undefined): Date {
     return asIfUtc;
   }
 
+  const guess = new Date(asIfUtc.getTime() - berlinOffsetMs(asIfUtc));
+  return new Date(asIfUtc.getTime() - berlinOffsetMs(guess));
+}
+
+function berlinOffsetMs(instant: Date): number {
   const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "Europe/Berlin",
+    timeZone: berlinTimeZone,
     year: "numeric",
     month: "numeric",
     day: "numeric",
@@ -26,7 +30,7 @@ export function parseAccompDatetime(value: string | undefined): Date {
     minute: "numeric",
     second: "numeric",
     hour12: false,
-  }).formatToParts(asIfUtc);
+  }).formatToParts(instant);
   const get = (type: string) =>
     Number(parts.find((p) => p.type === type)?.value ?? 0);
   const berlinAsUtcMs = Date.UTC(
@@ -37,7 +41,7 @@ export function parseAccompDatetime(value: string | undefined): Date {
     get("minute"),
     get("second"),
   );
-  return new Date(asIfUtc.getTime() - (berlinAsUtcMs - asIfUtc.getTime()));
+  return berlinAsUtcMs - instant.getTime();
 }
 
 export async function accompanyingParserOpportunity(

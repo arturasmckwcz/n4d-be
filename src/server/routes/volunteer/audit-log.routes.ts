@@ -3,10 +3,8 @@ import { UserRole } from "need4deed-sdk";
 import { UnauthorizedError } from "../../../config";
 import { dtoVolunteerAuditLog } from "../../../services/dto/dto-volunteer-audit-log";
 import { idParamSchema, volunteerAuditLogSchemaGet200 } from "../../schema";
+import { isStaffRole } from "../../utils";
 
-// Read-only audit trail for a volunteer's own record (be#919). Same
-// self-access shape as GET /volunteer/:id/doc (be#967): COORDINATOR/ADMIN
-// see any volunteer's log, a VOLUNTEER only their own.
 export default function volunteerAuditLogRoutes(
   fastify: FastifyInstance,
   _options: FastifyPluginOptions,
@@ -25,7 +23,7 @@ export default function volunteerAuditLogRoutes(
       const id = request.params.id;
       const role = request.authUser?.role;
 
-      if (role !== UserRole.COORDINATOR && role !== UserRole.ADMIN) {
+      if (!isStaffRole(role)) {
         if (role !== UserRole.VOLUNTEER) {
           throw new UnauthorizedError();
         }
@@ -43,7 +41,7 @@ export default function volunteerAuditLogRoutes(
 
       const entries = await fastify.db.volunteerAuditLogRepository.find({
         where: { volunteerId: id },
-        order: { occurredAt: "DESC" },
+        order: { occurredAt: "DESC", id: "DESC" },
       });
 
       return reply.send({

@@ -1,14 +1,17 @@
 import logger from "../../../logger";
+import { errorName } from "../../utils";
 import type { EmailMessage, EmailTransport } from "../types";
 import { validateEmailMessage } from "../validate-email-message";
 
+function joinAddresses(addresses: string | string[] | undefined) {
+  return Array.isArray(addresses) ? addresses.join(", ") : addresses;
+}
+
 function formatReport(msg: EmailMessage, problems: string[]): string {
-  const to = Array.isArray(msg.to) ? msg.to.join(", ") : msg.to;
-  const cc = msg.cc
-    ? Array.isArray(msg.cc)
-      ? msg.cc.join(", ")
-      : msg.cc
-    : undefined;
+  const to = joinAddresses(msg.to);
+  const cc = joinAddresses(msg.cc);
+  const replyTo = joinAddresses(msg.replyTo);
+  const attachments = msg.attachments?.map((a) => a.filename).join(", ");
 
   return [
     "An outbound email was suspended because it failed content validation:",
@@ -19,7 +22,9 @@ function formatReport(msg: EmailMessage, problems: string[]): string {
     `From: ${msg.from ?? "(default)"}`,
     `To: ${to}`,
     ...(cc ? [`Cc: ${cc}`] : []),
+    ...(replyTo ? [`Reply-To: ${replyTo}`] : []),
     `Subject: ${msg.subject}`,
+    ...(attachments ? [`Attachments: ${attachments}`] : []),
     "",
     "Text:",
     msg.text ?? "(none)",
@@ -27,20 +32,26 @@ function formatReport(msg: EmailMessage, problems: string[]): string {
   ].join("\n");
 }
 
-/**
- * Validates a computed EmailMessage before handing it to the real transport.
- * On failure, suspends the send and instead reports the full original
- * message + the problems found to `errorRecipient`, via `errorTransport`
- * rather than `deliverable` — this is an internal engineering alert, not
- * end-user-facing content, so it must always actually reach someone
- * regardless of dry-run config (pass the transport's real underlying SMTP
- * client here, not a dry-run-wrapped one).
- */
+export class SuspendedEmailError extends Error {
+  constructor(readonly problems: string[]) {
+    super(`email suspended: ${problems.join("; ")}`);
+    this.name = "SuspendedEmailError";
+  }
+}
+
+export class EmailSendError extends Error {
+  constructor(cause: unknown) {
+    super(`email not accepted: ${errorName(cause)}`, { cause });
+    this.name = "EmailSendError";
+  }
+}
+
 export class ValidatingEmailTransport implements EmailTransport {
   constructor(
     private readonly deliverable: EmailTransport,
     private readonly errorTransport: EmailTransport,
     private readonly errorRecipient: string,
+    private readonly rejectSuspended = false,
   ) {}
 
   async send(msg: EmailMessage): Promise<void> {
@@ -50,16 +61,28 @@ export class ValidatingEmailTransport implements EmailTransport {
       return;
     }
 
-    // No recipient or subject here: the report below carries them.
     logger.error(
       `[notify] suspended invalid outbound email: ${problems.join("; ")}`,
     );
 
-    await this.errorTransport.send({
-      to: this.errorRecipient,
-      from: msg.from,
-      subject: `[Suspended invalid email] ${msg.subject || "(no subject)"}`,
-      text: formatReport(msg, problems),
-    });
+    try {
+      await this.errorTransport.send({
+        to: this.errorRecipient,
+        from: msg.from,
+        subject: `[Suspended invalid email] ${msg.subject || "(no subject)"}`,
+        text: formatReport(msg, problems),
+      });
+    } catch (err) {
+      logger.error(
+        `[notify] suspended email report not sent: ${errorName(err)}`,
+      );
+      if (!this.rejectSuspended) {
+        throw err;
+      }
+    }
+
+    if (this.rejectSuspended) {
+      throw new SuspendedEmailError(problems);
+    }
   }
 }

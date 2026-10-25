@@ -1,34 +1,31 @@
 import type { EmailMessage, EmailTransport, SlackTransport } from "../types";
+import { DRY_RUN_RECIPIENT } from "./dry-run";
 
-const HEADER = "Cron email, not sent";
-// Slack's limit for a section's text.
+export const CRON_EMAIL_NOT_SENT = "Cron email, not sent";
+export const CRON_EMAIL_SENT = "Cron email, also sent by email";
+export const CRON_EMAIL_DRY_RUN = `Cron email, dry run: sent to ${DRY_RUN_RECIPIENT} only`;
 const SECTION_LIMIT = 3000;
-// Slack allows 50 blocks per message: header, fields and the body.
 const MAX_BODY_SECTIONS = 47;
 
-/**
- * An EmailTransport that posts the finished email to Slack #cron-notifications
- * instead of sending it (be#1088): coordinators see what the cron jobs would
- * have emailed. Wraps the notify plugin's Slack transport, so
- * NOTIFY_SLACK_DRY_RUN applies; it never sends an email, not even an error
- * one.
- *
- * The message's `text` (the notification preview, and what the dry-run
- * transport logs) is a fixed header: subjects and bodies can name people.
- */
 export class SlackEmailTransport implements EmailTransport {
-  constructor(private readonly slack: SlackTransport) {}
+  constructor(
+    private readonly slack: SlackTransport,
+    private readonly header: string = CRON_EMAIL_NOT_SENT,
+  ) {}
 
   async send(msg: EmailMessage): Promise<void> {
     await this.slack.send({
       channel: "cron",
-      text: HEADER,
-      blocks: emailBlocks(msg),
+      text: this.header,
+      blocks: emailBlocks(msg, this.header),
     });
   }
 }
 
-export function emailBlocks(msg: EmailMessage): unknown[] {
+export function emailBlocks(
+  msg: EmailMessage,
+  header: string = CRON_EMAIL_NOT_SENT,
+): unknown[] {
   const fields = [
     field("To", list(msg.to)),
     ...(msg.cc ? [field("Cc", list(msg.cc))] : []),
@@ -36,7 +33,7 @@ export function emailBlocks(msg: EmailMessage): unknown[] {
   ];
   const body = msg.text?.trim() || htmlToText(msg.html ?? "") || "(no body)";
   return [
-    { type: "header", text: { type: "plain_text", text: HEADER } },
+    { type: "header", text: { type: "plain_text", text: header } },
     { type: "section", fields },
     ...bodySections(body),
   ];
@@ -50,7 +47,6 @@ function field(label: string, value: string) {
   return { type: "mrkdwn", text: `*${label}*\n${escapeMrkdwn(value)}` };
 }
 
-// The three characters Slack's mrkdwn treats as control characters.
 function escapeMrkdwn(text: string): string {
   return text
     .replace(/&/g, "&amp;")
@@ -70,15 +66,10 @@ function bodySections(body: string): unknown[] {
   }));
 }
 
-/**
- * Splits `text` into chunks of at most `limit` characters, at a line break
- * where there is one in the chunk's second half.
- */
 export function splitText(text: string, limit: number): string[] {
   const chunks: string[] = [];
   let rest = text;
   while (rest.length > limit) {
-    // Room for the truncation marker bodySections may append.
     const window = rest.slice(0, limit - 20);
     const lineBreak = window.lastIndexOf("\n");
     const cut = lineBreak > window.length / 2 ? lineBreak : window.length;
@@ -100,7 +91,6 @@ const ENTITIES: Record<string, string> = {
   "&nbsp;": " ",
 };
 
-/** The text of an email's HTML: block ends become line breaks, tags go. */
 export function htmlToText(html: string): string {
   return html
     .replace(/<(style|script)[^>]*>[\s\S]*?<\/\1>/gi, "")

@@ -8,8 +8,10 @@ import {
   TimeSlot,
   TranslatedIntoType,
 } from "need4deed-sdk";
+import { berlinTimeZone } from "../../config";
 import DealLanguage from "../../data/entity/m2m/deal-language";
 import DealTimeslot from "../../data/entity/m2m/deal-timeslot";
+import { isByDayCode } from "../../data/utils/by-day-code";
 
 export function getAvailability(
   dealTimeslot: DealTimeslot[],
@@ -33,6 +35,7 @@ export function getAvailability(
       return {
         id: timeslot.id,
         daytime: new Date(timeslot.start).toLocaleString("de-DE", {
+          timeZone: berlinTimeZone,
           year: "numeric",
           month: "short",
           day: "2-digit",
@@ -55,10 +58,10 @@ export function getByDay(rrule: string): ByDay | null {
     return null;
   }
   const byDay = rrule.slice(byDayPos, byDayPos + 2);
-  if (!(byDay in ByDay)) {
+  if (!isByDayCode(byDay)) {
     throw new Error("RRule BYDAY value is not recognized");
   }
-  return ByDay[byDay as keyof typeof ByDay];
+  return ByDay[byDay];
 }
 
 export function getTimeSlotForDaytime(start: Date, end: Date): TimeSlot {
@@ -78,39 +81,113 @@ interface ScheduleLabels {
   day: Record<ByDay, string>;
   timeSlot: Record<TimeSlot, string>;
   occasional: Record<OccasionalType, string>;
+  and: string;
+  dayRange: string;
+}
+
+const SENTENCE_THRESHOLD = 3;
+const MIN_DAY_RANGE = 3;
+const WEEK = Object.values(ByDay);
+const TIME_SLOTS = Object.values(TimeSlot);
+
+function formatSlot(
+  { day, daytime }: ApiAvailability,
+  labels: ScheduleLabels,
+): string {
+  if (day === Occasionally.OCCASIONALLY) {
+    return labels.occasional[daytime as OccasionalType] ?? String(daytime);
+  }
+  if (day === null) {
+    throw new Error("Timeslot has a weekly rrule with no recognizable BYDAY");
+  }
+  if (day) {
+    const dayLabel = labels.day[day] ?? String(day);
+    const timeLabel = labels.timeSlot[daytime as TimeSlot] ?? String(daytime);
+    return `${dayLabel}, ${timeLabel}`;
+  }
+  return String(daytime);
+}
+
+function joinWithAnd(parts: string[], and: string): string {
+  return parts.length <= 1
+    ? parts.join("")
+    : `${parts.slice(0, -1).join(", ")} ${and} ${parts.at(-1)}`;
+}
+
+function joinDays(days: ByDay[], labels: ScheduleLabels): string {
+  const runs: ByDay[][] = [];
+  for (const day of days) {
+    const run = runs.at(-1);
+    if (run && WEEK.indexOf(day) === WEEK.indexOf(run.at(-1)!) + 1) {
+      run.push(day);
+    } else {
+      runs.push([day]);
+    }
+  }
+  const parts = runs.flatMap((run) =>
+    run.length >= MIN_DAY_RANGE
+      ? [`${labels.day[run[0]]} ${labels.dayRange} ${labels.day[run.at(-1)!]}`]
+      : run.map((day) => labels.day[day]),
+  );
+  return joinWithAnd(parts, labels.and);
+}
+
+function isWeeklySlot(
+  slot: ApiAvailability,
+): slot is { day: ByDay; daytime: TimeSlot } {
+  return (
+    WEEK.includes(slot.day as ByDay) &&
+    TIME_SLOTS.includes(slot.daytime as TimeSlot)
+  );
+}
+
+function formatScheduleSentence(
+  availability: ApiAvailability[],
+  labels: ScheduleLabels,
+): string {
+  const slotsByDay = new Map<ByDay, Set<TimeSlot>>();
+  const others: string[] = [];
+  for (const slot of availability) {
+    if (isWeeklySlot(slot)) {
+      const slots = slotsByDay.get(slot.day) ?? new Set<TimeSlot>();
+      slotsByDay.set(slot.day, slots.add(slot.daytime));
+    } else {
+      others.push(formatSlot(slot, labels));
+    }
+  }
+
+  const groups = new Map<string, { days: ByDay[]; slots: TimeSlot[] }>();
+  for (const day of WEEK) {
+    const daySlots = slotsByDay.get(day);
+    if (!daySlots) {
+      continue;
+    }
+    const slots = TIME_SLOTS.filter((slot) => daySlots.has(slot));
+    const key = slots.join();
+    const group = groups.get(key) ?? { days: [], slots };
+    group.days.push(day);
+    groups.set(key, group);
+  }
+
+  const weekly = [...groups.values()].map(
+    ({ days, slots }) =>
+      `${joinDays(days, labels)}, ${joinWithAnd(
+        slots.map((slot) => labels.timeSlot[slot]),
+        labels.and,
+      )}`,
+  );
+  return [...weekly, ...others].join("; ");
 }
 
 function formatSchedule(
   dealTimeslot: DealTimeslot[],
   labels: ScheduleLabels,
 ): string {
-  return (
-    getAvailability(dealTimeslot)
-      ?.map(({ day, daytime }) => {
-        if (day === Occasionally.OCCASIONALLY) {
-          return (
-            labels.occasional[daytime as OccasionalType] ?? String(daytime)
-          );
-        }
-        // `day === null` (as opposed to undefined, which is the genuine
-        // one-off-slot case below) means getByDay() couldn't find a BYDAY in
-        // a weekly rrule — malformed data, not a date string to fall back to.
-        if (day === null) {
-          throw new Error(
-            "Timeslot has a weekly rrule with no recognizable BYDAY",
-          );
-        }
-        if (day) {
-          const dayLabel = labels.day[day as ByDay] ?? String(day);
-          const timeLabel =
-            labels.timeSlot[daytime as TimeSlot] ?? String(daytime);
-          return `${dayLabel}, ${timeLabel}`;
-        }
-        // one-off slot: daytime is already a localized date/time string
-        return String(daytime);
-      })
-      .join(", ") ?? ""
-  );
+  const availability = getAvailability(dealTimeslot) ?? [];
+  if (availability.length > SENTENCE_THRESHOLD) {
+    return formatScheduleSentence(availability, labels);
+  }
+  return availability.map((slot) => formatSlot(slot, labels)).join(", ");
 }
 
 const DAY_LABELS_DE: Record<ByDay, string> = {
@@ -135,12 +212,13 @@ const OCCASIONAL_LABELS_DE: Record<OccasionalType, string> = {
   [OccasionalType.WEEKENDS]: "gelegentlich, am Wochenende",
 };
 
-// German-only, matching this codebase's other notify-email content (see be#838).
 export function formatScheduleDe(dealTimeslot: DealTimeslot[]): string {
   return formatSchedule(dealTimeslot, {
     day: DAY_LABELS_DE,
     timeSlot: TIME_SLOT_LABELS_DE,
     occasional: OCCASIONAL_LABELS_DE,
+    and: "und",
+    dayRange: "bis",
   });
 }
 
@@ -171,10 +249,6 @@ const OCCASIONAL_LABELS_DE_SHORT: Record<OccasionalType, string> = {
   [OccasionalType.WEEKENDS]: "am Wochenende",
 };
 
-// For volunteer-facing manifests that carry an English and a German part
-// (e.g. suggestion.json): one schedule per language, each part picking its
-// own via {{ opportunitySchedule.en }} / {{ opportunitySchedule.de }}
-// (be#1075) — was one "Montag/Monday" string shared by both parts (be#933).
 export function formatScheduleLocalized(
   dealTimeslot: DealTimeslot[],
 ): Record<Lang, string> {
@@ -183,11 +257,15 @@ export function formatScheduleLocalized(
       day: DAY_LABELS_EN,
       timeSlot: TIME_SLOT_LABELS_NEUTRAL,
       occasional: OCCASIONAL_LABELS_EN,
+      and: "and",
+      dayRange: "to",
     }),
     [Lang.DE]: formatSchedule(dealTimeslot, {
       day: DAY_LABELS_DE,
       timeSlot: TIME_SLOT_LABELS_NEUTRAL,
       occasional: OCCASIONAL_LABELS_DE_SHORT,
+      and: "und",
+      dayRange: "bis",
     }),
   };
 }
@@ -220,7 +298,6 @@ export function getCoordinates(postcode?: {
   };
 }
 
-// Match fe's own labels for these values (public/locales/{de,en}/translations.json).
 const STANDALONE_LABELS: Record<Lang, Record<TranslatedIntoType, string>> = {
   [Lang.DE]: {
     [TranslatedIntoType.DEUTSCHE]: "Nur Deutsch",
@@ -233,8 +310,6 @@ const STANDALONE_LABELS: Record<Lang, Record<TranslatedIntoType, string>> = {
     [TranslatedIntoType.NO_TRANSLATION]: "No translation",
   },
 };
-// The compact form of the target language(s), used only when there's an
-// actual source language to pair it with.
 const PAIR_TARGET_LABELS: Record<Lang, Record<TranslatedIntoType, string>> = {
   [Lang.DE]: {
     [TranslatedIntoType.DEUTSCHE]: "Deutsch",
@@ -248,16 +323,6 @@ const PAIR_TARGET_LABELS: Record<Lang, Record<TranslatedIntoType, string>> = {
   },
 };
 
-// Combines the accompanied person's translation-target requirement
-// (languageToTranslate — which language(s) the interpreter must translate
-// *into*) with the deal's requested source language(s) into a single
-// "Target-Source" pair per language, e.g. "Deutsch-Arabisch" rather than
-// showing them as two disconnected values ("Nur Deutsch, Arabisch") that
-// read like unrelated facts instead of the interpretation pair a volunteer
-// needs to cover. Falls back to the standalone label ("Nur Deutsch") when no
-// source language is recorded, since a bare "Deutsch" alone would read as
-// an incomplete pair rather than "German only, source unspecified".
-// `dealLanguageTitles` must already be in `lang`.
 export function formatAccompaniedPersonLanguage(
   languageToTranslate: TranslatedIntoType | undefined,
   dealLanguageTitles: string[],
@@ -276,13 +341,10 @@ export function formatAccompaniedPersonLanguage(
   return dealLanguageTitles.map((title) => `${target}-${title}`).join(", ");
 }
 
-// Shared by every accompanying/event notify email that renders a single
-// onetimer.date — was independently duplicated across 5 files (fe#1036
-// review); a future timezone/format change only needs to happen here.
 export function formatOnetimerDate(date: Date | undefined): string {
   return date
     ? new Date(date).toLocaleDateString("de-DE", {
-        timeZone: "Europe/Berlin",
+        timeZone: berlinTimeZone,
         year: "numeric",
         month: "2-digit",
         day: "2-digit",
@@ -293,7 +355,7 @@ export function formatOnetimerDate(date: Date | undefined): string {
 export function formatOnetimerTime(date: Date | undefined): string {
   return date
     ? new Date(date).toLocaleTimeString("de-DE", {
-        timeZone: "Europe/Berlin",
+        timeZone: berlinTimeZone,
         hour: "2-digit",
         minute: "2-digit",
       })

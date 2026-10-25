@@ -9,30 +9,40 @@ import {
   AgentEngagementStatusType,
   AgentMembershipStatus,
   ApiAgentRegister,
+  ApiOrganizationGetList,
   UserRole,
 } from "need4deed-sdk";
-import { UnauthenticatedError, UnauthorizedError } from "../../../config";
+import {
+  BaseError,
+  UnauthenticatedError,
+  UnauthorizedError,
+} from "../../../config";
 import logger from "../../../logger";
+import { dtoAgentRegisterStatus } from "../../../services/dto/dto-agent-register-status";
 import {
   registerAgentBodySchema,
   registerAgentConflictSchema,
   registerAgentQuerySchema,
   registerAgentResponseSchema,
+  registerAgentStatusResponseSchema,
   registerSearchQuerySchema,
   registerSearchResponseSchema,
   responseErrors,
+  responseSchema,
 } from "../../schema";
+import { ReplyData } from "../../types";
 import {
   createAgentForPerson,
+  findRegistrationMembership,
+  getAgentIdsJoinableAsActive,
+  getMembershipRequestNotificationText,
+  isExactStreetMatch,
   joinAgent,
-  resolveJoinStatus,
   searchAgentCandidates,
   verifyTokenOfType,
 } from "../../utils";
+import { listOrganizations } from "../../utils/data/list-organizations";
 
-// Authorizes the registration routes via the email-verification JWT carried in
-// the querystring (not a cookie/Bearer). Resolves the verified user and attaches
-// it as request.registrant. Throws typed errors so the status code is correct.
 async function authByVerifyToken(
   fastify: FastifyInstance,
   request: FastifyRequest,
@@ -64,19 +74,75 @@ async function authByVerifyToken(
   request.registrant = user;
 }
 
+function getRegistrantPersonId(request: FastifyRequest): number {
+  const user = request.registrant!;
+  if (!user.personId) {
+    logger.error(`register-agent: registrant ${user.id} has no linked person`);
+    throw new BaseError("Account is missing a person record.", 500);
+  }
+  return user.personId;
+}
+
 export default async function agentRegisterRoutes(
   fastify: FastifyInstance,
   _options: FastifyPluginOptions,
 ) {
-  // GET /agent/register/search?token=&street= — minimal agent lookup for the
-  // self-registration picker, so a registrant can JOIN their org instead of
-  // creating a duplicate. Token-gated (not the COORDINATOR-only GET /agent).
+  fastify.get<{ Querystring: { token: string } }>(
+    "/status",
+    {
+      config: { public: true } as FastifyContextConfig,
+      schema: {
+        querystring: registerAgentQuerySchema,
+        response: { 200: registerAgentStatusResponseSchema, ...responseErrors },
+      },
+      preHandler: (request, reply) =>
+        authByVerifyToken(fastify, request, reply),
+    },
+    async (request, reply) => {
+      const membership = await findRegistrationMembership(
+        getRegistrantPersonId(request),
+        { relations: ["agent"] },
+      );
+      return reply.status(200).send({
+        message: "Agent registration status.",
+        data: dtoAgentRegisterStatus(membership),
+      });
+    },
+  );
+
+  fastify.get<{
+    Querystring: { token: string };
+    Reply: ReplyData<ApiOrganizationGetList[]>;
+  }>(
+    "/organizations",
+    {
+      config: {
+        public: true,
+        rateLimit: { max: 30, timeWindow: "1 minute" },
+      } as FastifyContextConfig,
+      schema: {
+        querystring: registerAgentQuerySchema,
+        response: responseSchema("ApiOrganizationGetList#", true, false),
+      },
+      preHandler: (request, reply) =>
+        authByVerifyToken(fastify, request, reply),
+    },
+    async (_request, reply) =>
+      reply.status(200).send({
+        message: "Organizations found.",
+        data: await listOrganizations(fastify),
+      }),
+  );
+
   fastify.get<{
     Querystring: { token: string; street?: string };
   }>(
     "/search",
     {
-      config: { public: true } as FastifyContextConfig,
+      config: {
+        public: true,
+        rateLimit: { max: 30, timeWindow: "1 minute" },
+      } as FastifyContextConfig,
       schema: {
         querystring: registerSearchQuerySchema,
         response: { 200: registerSearchResponseSchema, ...responseErrors },
@@ -90,30 +156,6 @@ export default async function agentRegisterRoutes(
         return reply.status(200).send({ message: "No query", data: [] });
       }
 
-      // No membership/domain scoping here — matching is purely on
-      // agent.address.street (or agent.title when there's no address).
-      // Whether a picked agent auto-approves (ACTIVE) or needs review
-      // (PENDING) is decided later, at JOIN time, by resolveJoinStatus.
-      //
-      // Filtered in SQL rather than fetched-then-filtered in JS (be#902) —
-      // this route backs a per-keystroke autocomplete, so excluded agents no
-      // longer pay for an address join, a full row transfer, and entity
-      // hydration just to be discarded afterward. (No index on unclaimed/
-      // engagementStatus yet, so this doesn't avoid a sequential scan at the
-      // Postgres level — see be#980 if the agent table grows enough to matter.)
-      //
-      // A coordinator-created agent (fe#911) is `unclaimed` — it isn't
-      // claimable through self-registration's JOIN (which auto-approves on an
-      // email-domain match with zero coordinator review); exclude it here so
-      // it can only be linked through a future, explicitly-reviewed flow.
-      // Gating on this flag rather than "zero AgentPerson rows" matters: a
-      // legacy agent (created via POST /opportunity/legacy with no
-      // rac_email) can also have zero AgentPerson rows and must stay
-      // findable through this picker.
-      // An INACTIVE agent (be#885) is excluded too — a new registrant
-      // shouldn't be routed toward an NGO that's been marked inactive. This
-      // stays a fresh query on every request, so flipping the status back to
-      // ACTIVE immediately makes it findable again on the next search.
       const candidates = await fastify.db.agentRepository
         .createQueryBuilder("agent")
         .leftJoinAndSelect("agent.address", "address")
@@ -123,10 +165,17 @@ export default async function agentRegisterRoutes(
         })
         .getMany();
 
-      const data = searchAgentCandidates(candidates, street).map((a) => ({
-        id: a.id,
-        title: a.title,
-      }));
+      const matches = searchAgentCandidates(candidates, street);
+      const joinable = await getAgentIdsJoinableAsActive(
+        request.registrant?.email ?? "",
+        matches.map((a) => a.id),
+      );
+      const data = matches
+        .filter((a) => joinable.has(a.id) || isExactStreetMatch(a, street))
+        // Address-only matches must not reveal NGO names to untrusted registrants.
+        .map((a) =>
+          joinable.has(a.id) ? { id: a.id, title: a.title } : { id: a.id },
+        );
       return reply
         .status(200)
         .send({ message: `Found ${data.length} matches`, data });
@@ -136,8 +185,6 @@ export default async function agentRegisterRoutes(
   fastify.post<{ Body: ApiAgentRegister; Querystring: { token: string } }>(
     "/",
     {
-      // Public to the cookie/Bearer authenticate hook — authorized via the
-      // verify JWT in the querystring (preHandler below).
       config: { public: true } as FastifyContextConfig,
       schema: {
         querystring: registerAgentQuerySchema,
@@ -152,36 +199,38 @@ export default async function agentRegisterRoutes(
         authByVerifyToken(fastify, request, reply),
     },
     async (request, reply) => {
-      const user = request.registrant;
-      const personId = user?.personId;
-      if (!personId) {
-        logger.error(
-          `register-agent: registrant ${user?.id} has no linked person`,
-        );
-        return reply
-          .status(500)
-          .send({ message: "Account is missing a person record." });
-      }
-
+      const personId = getRegistrantPersonId(request);
+      const email = request.registrant!.email;
       const body = request.body;
 
-      // joinAgent/createAgentForPerson throw typed BaseError subclasses
-      // (UnauthorizedError, NotFoundError, AgentAddressConflictError,
-      // AgentTitleConflictError) — let them propagate to the global error
-      // handler rather than translating them here.
       const result =
         "agentId" in body
-          ? await joinAgent(
-              personId,
-              body.agentId,
-              await resolveJoinStatus(body.agentId, user!.email),
-            )
-          : await createAgentForPerson(personId, body.agent);
+          ? await joinAgent(personId, body.agentId, email)
+          : await createAgentForPerson(personId, body.agent, email);
 
-      const message =
-        result.membershipStatus === AgentMembershipStatus.PENDING
-          ? "Join request submitted — an administrator will review it."
-          : "Agent registration complete.";
+      const pending = result.membershipStatus === AgentMembershipStatus.PENDING;
+      if (pending) {
+        // The join is already committed: a failed alert must not turn it into a 500.
+        try {
+          const agent = await fastify.db.agentRepository.findOne({
+            select: { id: true, title: true },
+            where: { id: result.agentId },
+          });
+          fastify.notify.opsAlert(
+            getMembershipRequestNotificationText(
+              agent?.title ?? `#${result.agentId}`,
+            ),
+          );
+        } catch (err) {
+          logger.warn(
+            `register-agent: join request alert failed for agent ${result.agentId}: ${err instanceof Error ? err.message : err}`,
+          );
+        }
+      }
+
+      const message = pending
+        ? "Join request submitted — an administrator will review it."
+        : "Agent registration complete.";
 
       return reply.status(201).send({ message, data: result });
     },

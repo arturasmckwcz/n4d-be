@@ -1,4 +1,4 @@
-import { OpportunityType } from "need4deed-sdk";
+import { OpportunityType, TranslationStatus } from "need4deed-sdk";
 import {
   Between,
   FindOptionsWhere,
@@ -7,15 +7,17 @@ import {
   LessThanOrEqual,
   MoreThanOrEqual,
   Not,
+  Raw,
 } from "typeorm";
-import { BadRequestError } from "../../../config/error";
 import Opportunity from "../../../data/entity/opportunity/opportunity.entity";
-import { berlinDayBoundaries } from "../../../services/jobs/german-holidays";
+import { berlinDayBoundaries } from "../../../services/jobs/berlin-dates";
 import {
   QuerystringOpportunityFiltering,
   QuerystringOpportunityList,
 } from "../../types";
 import { normalizeStringArrayInput } from "./for-routes";
+import { dealIdIn } from "./get-availability-deal-ids";
+import { parseDateOnly } from "./parse-date-only";
 import { escapeLikePattern } from "./person-name-ilike";
 
 export type OpportunityAppointmentFilter = Pick<
@@ -26,28 +28,52 @@ export type OpportunityAppointmentFilter = Pick<
   | "excludeAccompanying"
 >;
 
-// Arrays are truthy even when empty, so a plain `if (filter?.x)` check
-// treats `x: []` as "filter requested" — and normalizeStringArrayInput's
-// In([]) compiles to an always-false 0=1, silently zeroing every result
-// instead of applying no filter at all. Every array-shaped filter value in
-// this file goes through this check instead of a bare truthiness one
-// (be#1018's district fix was the first instance of this bug class here).
-function hasFilterValue(value: string | string[] | undefined): boolean {
-  return Array.isArray(value) ? value.length > 0 : Boolean(value);
+type SearchField = "title" | "info";
+
+const SEARCH_FIELDS: readonly SearchField[] = ["title", "info"];
+
+// Mirrors translation/resolve.ts: a translation is only displayed when it is
+// DONE, in the response language, and its sourceHash still matches the
+// current (JS-trimmed) source text.
+const TRIM_CHARS = " \t\n\r\f\v\u00a0\ufeff";
+const TRANSLATION_SEARCH_SQL = (alias: string) => `${alias} IN (
+  SELECT ft.opportunity_id
+    FROM field_translation ft
+    JOIN opportunity o ON o.id = ft.opportunity_id
+   WHERE ft.language_id = :searchLanguageId
+     AND ft.status = :searchTranslationStatus
+     AND ft.field_name IN (:...searchFields)
+     AND ft.translation ILIKE :searchPattern
+     AND ft.source_hash = encode(sha256(convert_to(btrim(
+           CASE ft.field_name WHEN 'title' THEN o.title ELSE o.info END,
+           :searchTrimChars), 'UTF8')), 'hex'))`;
+
+// Matches the original text or its displayed translation in the request
+// language, on the given fields only.
+export function getSearchBranches(
+  pattern: string,
+  languageId?: number,
+  fields: readonly SearchField[] = SEARCH_FIELDS,
+): FindOptionsWhere<Opportunity>[] {
+  const branches: FindOptionsWhere<Opportunity>[] = fields.map((field) => ({
+    [field]: ILike(pattern),
+  }));
+  if (languageId !== undefined) {
+    branches.push({
+      id: Raw(TRANSLATION_SEARCH_SQL, {
+        searchLanguageId: languageId,
+        searchFields: fields,
+        searchTranslationStatus: TranslationStatus.DONE,
+        searchPattern: pattern,
+        searchTrimChars: TRIM_CHARS,
+      }),
+    });
+  }
+  return branches;
 }
 
-// appointmentDateFrom/To are Berlin calendar days ("2026-06-30"), not UTC
-// ones — this is a Berlin-based product and Opportunity.onetimer.date is
-// filtered the same way elsewhere (berlinDayBoundaries, used by
-// scanAccompanyNotFound). Parsing with `new Date(value)` would instead
-// anchor the range to UTC midnight, shifting it by Berlin's UTC offset.
-function parseAppointmentDate(value: string): Date {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
-  if (!match) {
-    throw new BadRequestError(`Invalid date: "${value}"`);
-  }
-  const [, year, month, day] = match;
-  return new Date(Number(year), Number(month) - 1, Number(day));
+function hasFilterValue(value: string | string[] | undefined): boolean {
+  return Array.isArray(value) ? value.length > 0 : Boolean(value);
 }
 
 function getAppointmentDateWhere(
@@ -59,12 +85,11 @@ function getAppointmentDateWhere(
   if (appointmentDateFrom !== undefined || appointmentDateTo !== undefined) {
     const from =
       appointmentDateFrom !== undefined
-        ? berlinDayBoundaries(parseAppointmentDate(appointmentDateFrom))
-            .startOfDay
+        ? berlinDayBoundaries(parseDateOnly(appointmentDateFrom)).startOfDay
         : undefined;
     const to =
       appointmentDateTo !== undefined
-        ? berlinDayBoundaries(parseAppointmentDate(appointmentDateTo)).endOfDay
+        ? berlinDayBoundaries(parseDateOnly(appointmentDateTo)).endOfDay
         : undefined;
 
     return {
@@ -79,8 +104,6 @@ function getAppointmentDateWhere(
     } as FindOptionsWhere<Opportunity>;
   }
 
-  // A range already implies "has an appointment date" — this flag only
-  // matters on its own.
   if (hasAppointmentDate) {
     return { onetimerId: Not(IsNull()) } as FindOptionsWhere<Opportunity>;
   }
@@ -94,9 +117,6 @@ function getTypeWhere(
 ): FindOptionsWhere<Opportunity> {
   if (hasFilterValue(filter?.type)) {
     const types = Array.isArray(filter.type) ? filter.type : [filter.type];
-    // Combine rather than defer: an explicit type list that happens to
-    // include "accompanying" still gets it stripped when excludeAccompanying
-    // is also set, so the flag's name isn't silently contradicted.
     const filtered = excludeAccompanying
       ? types.filter((type) => type !== OpportunityType.ACCOMPANYING)
       : types;
@@ -112,16 +132,6 @@ function getTypeWhere(
     : {};
 }
 
-// language, activity and skill all constrain the same `deal` relation, so
-// they must accumulate onto one shared `deal` key rather than each writing
-// their own top-level spread — two spreads with the same key have the
-// second replace the first, silently dropping the earlier constraint.
-// Mirrors get-volunteer-where.ts's identical dealFilter.
-//
-// district is deliberately NOT included here (see getOpportunityWhere):
-// `deal.dealDistrict` is an optional preference list that's empty for most
-// opportunities, so filtering on it alone excludes ones that only have the
-// reliable `Opportunity.districtId` set (be#1018).
 function getDealWhere(
   filter: QuerystringOpportunityFiltering["filter"],
 ): Record<string, unknown> {
@@ -144,15 +154,16 @@ function getDealWhere(
   return dealFilter;
 }
 
-// SECURITY (#666): filters run on unmasked DB columns, so a non-privileged
-// caller can infer PII masked in the response by probing which rows match.
 export function getOpportunityWhere(
   filter: QuerystringOpportunityFiltering["filter"],
   appointment?: OpportunityAppointmentFilter,
+  searchLanguageId?: number,
+  availabilityDealIds: number[] | null = null,
 ): FindOptionsWhere<Opportunity> | FindOptionsWhere<Opportunity>[] {
   const dealFilter = getDealWhere(filter);
 
   const base = {
+    ...(availabilityDealIds ? { dealId: dealIdIn(availabilityDealIds) } : {}),
     ...getTypeWhere(filter, appointment?.excludeAccompanying),
     ...getAppointmentDateWhere(appointment),
     ...(hasFilterValue(filter?.status)
@@ -160,32 +171,32 @@ export function getOpportunityWhere(
           status: normalizeStringArrayInput(filter.status),
         }
       : {}),
-    ...(filter?.search
-      ? {
-          title: ILike(`%${escapeLikePattern(filter.search)}%`),
-        }
-      : {}),
     ...(Object.keys(dealFilter).length ? { deal: dealFilter } : {}),
   } as FindOptionsWhere<Opportunity>;
 
+  const searchPattern = filter?.search
+    ? `%${escapeLikePattern(filter.search)}%`
+    : undefined;
+  let branches: FindOptionsWhere<Opportunity>[] = searchPattern
+    ? getSearchBranches(searchPattern, searchLanguageId).map((branch) => ({
+        ...base,
+        ...branch,
+      }))
+    : [base];
+
   if (hasFilterValue(filter?.district)) {
     const districtIds = normalizeStringArrayInput(filter!.district!);
-    // Two independent, differently-shaped sources can place an opportunity
-    // in a district: its own reliable `districtId` FK, or the optional
-    // `deal.dealDistrict` preference list (be#1018). They live on different
-    // root relations, so expressing "either" requires TypeORM's array-of-
-    // FindOptionsWhere OR — nesting them under one key isn't possible.
-    return [
-      { ...base, districtId: districtIds },
+    branches = branches.flatMap((branch) => [
+      { ...branch, districtId: districtIds },
       {
-        ...base,
+        ...branch,
         deal: {
-          ...((base.deal as Record<string, unknown>) ?? {}),
+          ...((branch.deal as Record<string, unknown>) ?? {}),
           dealDistrict: { district: { id: districtIds } },
         },
       },
-    ] as FindOptionsWhere<Opportunity>[];
+    ]) as FindOptionsWhere<Opportunity>[];
   }
 
-  return base;
+  return branches.length === 1 ? branches[0] : branches;
 }

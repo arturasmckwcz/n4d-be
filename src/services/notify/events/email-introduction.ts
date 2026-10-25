@@ -1,4 +1,4 @@
-import { DocumentStatusType } from "need4deed-sdk";
+import { DocumentStatusType, Lang } from "need4deed-sdk";
 import {
   emailFromContact,
   emailFromNotify,
@@ -13,11 +13,8 @@ import {
   getOptionItems,
 } from "../../dto/utils";
 import { INTRODUCTION_BUILTIN as BUILTIN } from "../builtin-content";
-import {
-  createManifestLoader,
-  fillTemplate,
-  resolveFlatContent,
-} from "../email-template";
+import { createManifestLoader, renderEmailWithNote } from "../email-template";
+import { opportunityTitleIn } from "../opportunity-title";
 import { DEAL_LANGUAGE_LABELS, resolveOrAlert } from "../resolve-or-alert";
 import { resolveScheduleOrAlert } from "../resolve-schedule-or-alert";
 import type { EmailTransport } from "../types";
@@ -28,28 +25,6 @@ export function resetIntroductionTemplateCache(): void {
   loader.resetCache();
 }
 
-// German-only — this template is no longer split by recipient locale (see
-// be#838). The six sentences below are the only copy of this wording; they
-// fill introduction.json's flat {{ statmentOnCertificates }} placeholder
-// (there is no separate certificateStatements block in that manifest, CDN
-// or fallback).
-//
-// Previously branched on statusCgcProcess (UPLOADED/MISSING) to detect
-// "already applied", but nothing in fe ever sets that field — the
-// coordinator UI's CGC-application toggle instead writes statusCGC =
-// APPLIED_N4D directly (VolunteerProfileDocument.tsx). Since neither
-// cgcNo nor cgcYes matched APPLIED_N4D, that was the common case and this
-// always rendered a blank statement for it (be#1042 review). Reads
-// statusCGC's own three real, reachable values instead: NO (the volunteer
-// self-registration form's "Need to apply" answer), APPLIED_N4D (N4D
-// applied on the volunteer's behalf), YES (received).
-//
-// UNDEFINED — the column's own DB default (volunteer.entity.ts) — and
-// ASKED_TO_APPLY/APPLIED_SELF (unused by any writer today, confirmed by
-// grep) deliberately fall back to blank rather than asserting "we'll apply
-// immediately": UNDEFINED means the status was simply never set, and
-// APPLIED_SELF means the *volunteer* said they'd apply themselves, the
-// opposite of what that sentence claims (be#1043 review).
 function resolveStatmentOnCertificates(
   statusCGC: DocumentStatusType,
   statusVaccination: DocumentStatusType,
@@ -83,10 +58,8 @@ function resolveStatmentOnCertificates(
 export async function sendEmailIntroduction(
   email: EmailTransport,
   ov: OpportunityVolunteer,
-  // Bypasses dry-run redirection, same as ValidatingEmailTransport's
-  // errorTransport (be#847) — defaults to `email` for callers that don't
-  // care about that distinction (e.g. tests with a single mock transport).
   errorTransport: EmailTransport = email,
+  emailNote?: string,
 ): Promise<void> {
   const volunteerEmail = ov.volunteer?.person?.email;
   const contactPerson = getOpportunityRepresentativePerson(ov.opportunity);
@@ -103,7 +76,10 @@ export async function sendEmailIntroduction(
 
   const volunteerName = volunteer.person.name;
   const contactpersonName = contactPerson.name;
-  const volunteeringopportunityName = opportunity.title;
+  const volunteeringopportunityName = await opportunityTitleIn(
+    opportunity,
+    Lang.DE,
+  );
 
   const volunteerLanguage = await resolveOrAlert(
     errorTransport,
@@ -150,9 +126,6 @@ export async function sendEmailIntroduction(
       .filter(Boolean)
       .join(", ");
   })();
-  // be#1050: RAC/shelter agents are often named after their street, so this
-  // reads as "for {opportunity} in {NGO}" in the subject rather than just
-  // naming the volunteer and opportunity with no NGO context.
   const agentTitle = opportunity.agent?.title ?? "";
 
   const statmentOnCertificates = resolveStatmentOnCertificates(
@@ -160,22 +133,26 @@ export async function sendEmailIntroduction(
     volunteer.statusVaccination,
   );
 
-  const content = resolveFlatContent(await loader.load(), BUILTIN);
-  const { subject, text, html } = fillTemplate(content, {
-    contactpersonName,
-    volunteerName,
-    volunteeringopportunityName,
-    volunteerSkills,
-    volSchedule,
-    volunteerLanguage,
-    volunteerEmail,
-    volunteerPhone: volunteer.person.phone ?? "",
-    contactpersonEmail: contactPersonEmail,
-    contactpersonPhone: contactPerson.phone ?? "",
-    agentAddress,
-    agentTitle,
-    statmentOnCertificates,
-  });
+  const { subject, text, html } = renderEmailWithNote(
+    await loader.load(),
+    BUILTIN,
+    {
+      contactpersonName,
+      volunteerName,
+      volunteeringopportunityName,
+      volunteerSkills,
+      volSchedule,
+      volunteerLanguage,
+      volunteerEmail,
+      volunteerPhone: volunteer.person.phone ?? "",
+      contactpersonEmail: contactPersonEmail,
+      contactpersonPhone: contactPerson.phone ?? "",
+      agentAddress,
+      agentTitle,
+      statmentOnCertificates,
+    },
+    emailNote,
+  );
 
   await email.send({
     to: [volunteerEmail, contactPersonEmail],

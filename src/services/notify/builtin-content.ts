@@ -1,19 +1,3 @@
-// Fallback content for every notify email, used when the CDN manifest for
-// that email can't be loaded (fetch failure/timeout) or lacks a valid entry
-// for the requested locale. Kept in one file so editing copy doesn't require
-// hunting through every event file in ./events.
-//
-// Mirrors dev/cdn/emails/*.json (the live CDN content) exactly, so a
-// fallback looks the same as the real thing. Most of these are flat — a
-// single body used regardless of recipient — either because they're
-// German-only (RAC/contact-person workflow) or because they bilingually
-// concatenate English+German in one body (volunteer-facing workflow, where
-// the recipient's language can't be reliably known; see be#830/#838).
-// In the bilingual ones, a translatable value picks the language of its part
-// with {{ key.en }} / {{ key.de }} (be#1075).
-// PASSWORD_RESET_BUILTIN and TAGGED_BUILTIN are split per locale instead:
-// no flat manifest was provided for the former, and the latter goes to a
-// dashboard user whose language is known.
 import { Lang } from "need4deed-sdk";
 import type { LocaleContent } from "./email-template";
 
@@ -41,23 +25,23 @@ export const REGULAR_UPDATE_BUILTIN: LocaleContent = {
 export const INTRODUCTION_BUILTIN: LocaleContent = {
   subject:
     "Vorstellung-Vermittlung: {{ volunteerName }} für {{ volunteeringopportunityName }} in {{ agentTitle }}",
-  text: `Hallo {{ contactpersonName }}, hallo {{ volunteerName }},\n \nwir möchten euch gerne für die Aktivität „{{ volunteeringopportunityName }}“ einander vorstellen. \n \n{{ volunteerName }} spricht {{ volunteerLanguage }}, hat folgende Fähigkeiten: {{ volunteerSkills }}, die für diese ehrenamtliche Tätigkeit nützlich sein können. \n{{ volunteerName }} ist an folgenden Tagen und zu folgenden Uhrzeiten verfügbar: {{ volSchedule }}.\n \n{{ statmentOnCertificates }}\n \nDie Kontaktdaten von {{ volunteerName }} sind:\n{{ volunteerName }}\n{{ volunteerEmail }}\n{{ volunteerPhone }}\n \nDie Kontaktdaten der Einrichtung sind:\n{{ contactpersonName }}\n{{ contactpersonEmail }}\n{{ contactpersonPhone }}\n{{ agentAddress }}\n \nEs wäre super, wenn Ihr einen Kennenlernentermin vereinbart, um alles in Detail zu besprechen. Bei Fragen könnt ihr euch gerne bei uns melden.\n \nViele Grüße\nNeed4Deed\ncontact@need4deed.org`,
+  text: `Hallo {{ contactpersonName }}, hallo {{ volunteerName }},\n \nwir möchten euch gerne für die Aktivität „{{ volunteeringopportunityName }}“ einander vorstellen. \n \n{{ volunteerName }} spricht {{ volunteerLanguage }}, hat folgende Fähigkeiten: {{ volunteerSkills }}, die für diese ehrenamtliche Tätigkeit nützlich sein können. \n{{ volunteerName }} ist an folgenden Tagen und zu folgenden Uhrzeiten verfügbar: {{ volSchedule }}.\n \n{{ statmentOnCertificates }}\n \nDie Kontaktdaten von {{ volunteerName }} sind:\n{{ volunteerName }}\n{{ volunteerEmail }}\n{{ volunteerPhone }}\n \nDie Kontaktdaten der Einrichtung sind:\n{{ contactpersonName }}\n{{ contactpersonEmail }}\n{{ contactpersonPhone }}\n{{ agentAddress }}\n \nEs wäre super, wenn Ihr einen Kennenlernentermin vereinbart, um alles in Detail zu besprechen. Bei Fragen könnt ihr euch gerne bei uns melden.\n \n{{ emailNote }}\n \nViele Grüße\nNeed4Deed\ncontact@need4deed.org`,
 };
 
 export const ACCOMPANY_MATCH_BUILTIN: LocaleContent = {
   subject:
     "Begleitung zum Termin am {{ appointmentDate }} in {{ appointmentDistrict }} für {{ clientName }}",
-  text: `Hallo {{ contactpersonName }},\n \n{{ volunteerName }} übernimmt gerne die Unterstützung bei dem Termin am {{ appointmentDate }}. {{ volunteerName }} spricht {{ volunteerLanguage }}.\n \n{{ volunteerName }} hat schon die Kontaktdaten von {{ clientName }} bekommen und meldet sich zeitnah bei der Person.\n \n{{ contactSharing }}\n \nViele Grüße\nNeed4Deed`,
+  text: `Hallo {{ contactpersonName }},\n \n{{ volunteerName }} übernimmt gerne die Unterstützung bei dem Termin am {{ appointmentDate }}. {{ volunteerName }} spricht {{ volunteerLanguage }}.\n \n{{ volunteerName }} hat schon die Kontaktdaten von {{ clientName }} bekommen und meldet sich zeitnah bei der Person.\n \n{{ contactSharing }}\n \n{{ emailNote }}\n \nViele Grüße\nNeed4Deed`,
 };
 
 export const SUGGESTION_BUILTIN: LocaleContent = {
   subject: "Volunteering opportunity match — Need4Deed",
-  text: `Dear {{ volunteerName }},\n \nWe have an opportunity that may interest you: {{ opportunityName }}, in Berlin {{ plz }} taking place on {{ opportunitySchedule.en }}. If you'd like to volunteer, please reply to volunteer@need4deed.org in the next 10 days.\n\nThe Need4Deed Team :)\nvolunteer@need4deed.org\n\nHallo {{ volunteerName }},\n\nWir haben eine Möglichkeit, die dich interessieren könnte: {{ opportunityName }}, in Berlin {{ plz }}, am {{ opportunitySchedule.de }}.\nWenn du dich ehrenamtlich engagieren möchtest, antworte bitte innerhalb der nächsten 10 Tage an volunteer@need4deed.org.\n\nDas Need4Deed-Team :)\nvolunteer@need4deed.org`,
+  text: `Dear {{ volunteerName }},\n \nWe have an opportunity that may interest you: {{ opportunityName.en }}, in Berlin {{ plz }}. When: {{ opportunitySchedule.en }}{{ scheduleNote.en }}. If you'd like to volunteer, please reply to volunteer@need4deed.org in the next 10 days.\n\nThe Need4Deed Team :)\nvolunteer@need4deed.org\n\nHallo {{ volunteerName }},\n\nWir haben eine Möglichkeit, die dich interessieren könnte: {{ opportunityName.de }}, in Berlin {{ plz }}. Wann: {{ opportunitySchedule.de }}{{ scheduleNote.de }}.\nWenn du dich ehrenamtlich engagieren möchtest, antworte bitte innerhalb der nächsten 10 Tage an volunteer@need4deed.org.\n\n{{ emailNote }}\n\nDas Need4Deed-Team :)\nvolunteer@need4deed.org`,
 };
 
 export const SUGGESTION_ACCOMPANYING_BUILTIN: LocaleContent = {
   subject: "Accompanying opportunity match — Need4Deed",
-  text: `Dear {{ volunteerName }},\n \nWe are looking for a volunteer to support for the following appointment:\nTitle: {{ appointmentTitle }}\nAddress: {{ appointmentAddress }}, {{ appointmentPlz }}\nDate and time: {{ appointmentDate }} at {{ appointmentTime }}\nLanguage: {{ accompaniedpersonLanguage.en }}\n \nWould it be possible for you to do that? Please let us know by responding to accompanying@need4deed.org.\n\nThe Need4Deed Team :)\n\nHallo {{ volunteerName }},\n \nwir suchen nach einer Person, die Zeit und Lust hätte, bei einem Termin ehrenamtlich zu unterstützen.\nTitel: {{ appointmentTitle }}\nAdresse: {{ appointmentAddress }}, {{ appointmentPlz }}\nDatum und Uhrzeit: {{ appointmentDate }} um {{ appointmentTime }}\nSprache: {{ accompaniedpersonLanguage.de }}\n \nWäre es für dich möglich, diese Begleitung zu übernehmen? Antworte bitte an accompanying@need4deed.org.\nDas Need4Deed-Team :)\naccompanying@need4deed.org`,
+  text: `Dear {{ volunteerName }},\n \nWe are looking for a volunteer to support for the following appointment:\nTitle: {{ appointmentTitle.en }}\nAddress: {{ appointmentAddress }}, {{ appointmentPlz }}\nDate and time: {{ appointmentDate }} at {{ appointmentTime }}\nLanguage: {{ accompaniedpersonLanguage.en }}\n \nWould it be possible for you to do that? Please let us know by responding to accompanying@need4deed.org.\n\nThe Need4Deed Team :)\n\nHallo {{ volunteerName }},\n \nwir suchen nach einer Person, die Zeit und Lust hätte, bei einem Termin ehrenamtlich zu unterstützen.\nTitel: {{ appointmentTitle.de }}\nAdresse: {{ appointmentAddress }}, {{ appointmentPlz }}\nDatum und Uhrzeit: {{ appointmentDate }} um {{ appointmentTime }}\nSprache: {{ accompaniedpersonLanguage.de }}\n \nWäre es für dich möglich, diese Begleitung zu übernehmen? Antworte bitte an accompanying@need4deed.org.\n\n{{ emailNote }}\n\nDas Need4Deed-Team :)\naccompanying@need4deed.org`,
 };
 
 export const REGISTRATION_BUILTIN: LocaleContent = {
@@ -67,7 +51,7 @@ export const REGISTRATION_BUILTIN: LocaleContent = {
 
 export const ACCOMPANY_MATCH_VOLUNTEER_BUILTIN: LocaleContent = {
   subject: "Deine Begleitung am {{ appointmentDate }} — Need4Deed",
-  text: `Dear {{ volunteerName }},\n \nThank you for taking on this accompanying opportunity. Here are the details:\nTitle: {{ appointmentTitle }}\nDate and time: {{ appointmentDate }} at {{ appointmentTime }}\nAddress: {{ appointmentAddress }}, {{ appointmentPlz }}\nAccompanied person: {{ accompaniedpersonName }}, {{ accompaniedpersonPhone }}\nLanguages: {{ accompaniedpersonLanguage.en }}\nAdditional information: {{ appointmentComment }}\n \nIf you have any questions, the contact at the organisation is:\n{{ contactpersonName }}\n{{ contactpersonEmail }}\n{{ contactpersonPhone }}\n \nThank you again for volunteering.\n\nThe Need4Deed Team :)\n\nHallo {{ volunteerName }},\n \nvielen Dank, dass du diese Begleitung übernimmst. Hier sind die Details:\nTitel: {{ appointmentTitle }}\nDatum und Uhrzeit: {{ appointmentDate }} um {{ appointmentTime }}\nAdresse: {{ appointmentAddress }}, {{ appointmentPlz }}\nBegleitete Person: {{ accompaniedpersonName }}, {{ accompaniedpersonPhone }}\nSprachen: {{ accompaniedpersonLanguage.de }}\nZusätzliche Informationen: {{ appointmentComment }}\n \nBei Fragen ist der Kontakt bei der Einrichtung:\n{{ contactpersonName }}\n{{ contactpersonEmail }}\n{{ contactpersonPhone }}\n \nVielen Dank für dein Engagement.\n\nDas Need4Deed-Team :)`,
+  text: `Dear {{ volunteerName }},\n \nThank you for taking on this accompanying opportunity. Here are the details:\nTitle: {{ appointmentTitle.en }}\nDate and time: {{ appointmentDate }} at {{ appointmentTime }}\nAddress: {{ appointmentAddress }}, {{ appointmentPlz }}\nAccompanied person: {{ accompaniedpersonName }}, {{ accompaniedpersonPhone }}\nLanguages: {{ accompaniedpersonLanguage.en }}\nAdditional information: {{ appointmentComment }}\n \nIf you have any questions, the contact at the organisation is:\n{{ contactpersonName }}\n{{ contactpersonEmail }}\n{{ contactpersonPhone }}\n \nThank you again for volunteering.\n\nThe Need4Deed Team :)\n\nHallo {{ volunteerName }},\n \nvielen Dank, dass du diese Begleitung übernimmst. Hier sind die Details:\nTitel: {{ appointmentTitle.de }}\nDatum und Uhrzeit: {{ appointmentDate }} um {{ appointmentTime }}\nAdresse: {{ appointmentAddress }}, {{ appointmentPlz }}\nBegleitete Person: {{ accompaniedpersonName }}, {{ accompaniedpersonPhone }}\nSprachen: {{ accompaniedpersonLanguage.de }}\nZusätzliche Informationen: {{ appointmentComment }}\n \nBei Fragen ist der Kontakt bei der Einrichtung:\n{{ contactpersonName }}\n{{ contactpersonEmail }}\n{{ contactpersonPhone }}\n \nVielen Dank für dein Engagement.\n\nDas Need4Deed-Team :)`,
 };
 
 export const NEW_REGULAR_BUILTIN: LocaleContent = {
@@ -100,23 +84,16 @@ export const PASSWORD_RESET_BUILTIN: Record<Lang, LocaleContent> = {
   },
 };
 
-// Wording for the "you were tagged" email's per-language values; a manifest
-// entry can override any of them under "labels" (be#1075).
 export interface TaggedLabels {
   commentOnVolunteer: string;
   commentOnOpportunity: string;
   commentOnAgent: string;
   comment: string;
   post: string;
-  // Author with no name.
   someone: string;
-  // Greeting for a recipient with no name ("Hi there").
   noName: string;
 }
 
-// {{ where }} and {{ link }} are per-language values; {{ tagText }},
-// {{ authorName }} and {{ recipientName }} are user content, or a label
-// when the name is missing.
 export const TAGGED_BUILTIN: Record<
   Lang,
   LocaleContent & { labels: TaggedLabels }
@@ -146,5 +123,16 @@ export const TAGGED_BUILTIN: Record<
       someone: "Jemand",
       noName: "zusammen",
     },
+  },
+};
+
+export const CGC_APPLICATION_BUILTIN: Record<Lang, LocaleContent> = {
+  [Lang.EN]: {
+    subject: "Your certificate of good conduct application — Need4Deed",
+    text: `Hi {{ volunteerName }},\n\nIn order for you to volunteer with a refugee accommodation center, you need a certificate of good conduct which we can apply for on your behalf. Please fill out the attached document "EFZ_Antrag_V" and send it back to us by replying to this email, together with a copy of your passport (Aufenthaltstitel in this case is not a valid form of ID) or a German ID. Our community team ({{ communityEmail }}) is copied.\n\nHere are tips on how to fill it out:\n1. On the top right corner next to "Berlin, der" please write today's date.\n2. Left of "hiermit beantrage ich," please write your first and last name.\n3. "Geb. am": please write your birthday DD.MM.YYYY in State/City and Country of your birth.\n4. "Wohnhaft" is your current Berlin registration address (Anmeldung address).\n5. Under "Mit freundlichen Grüßen," please write your name with an additional signature.\n\nOnce you send us the signed form, we will submit the application to the Bezirksamt and you will receive it by post within 2-4 weeks. Please let us know when you receive it.\n\nAlso to get involved regularly in an accommodation center, you would need to show your vaccine to measles.\n\nWe are also linking our data protection and volunteering policies for your reference:\n{{ dataPrivacyUrl }}\n{{ agreementUrl }}\n\nOnce you have sent us these documents, we will match you with the accommodation center and you can take it from there.\n\nAll the best,\n{{ signature }}`,
+  },
+  [Lang.DE]: {
+    subject: "Dein Antrag auf ein erweitertes Führungszeugnis — Need4Deed",
+    text: `Hallo {{ volunteerName }},\n\nfür ein Ehrenamt in einer Unterkunft für Geflüchtete brauchst du ein erweitertes Führungszeugnis, das wir für dich beantragen können. Bitte fülle das angehängte Dokument „EFZ_Antrag_V“ aus und schicke es uns als Antwort auf diese E-Mail zusammen mit einer Kopie deines Reisepasses (ein Aufenthaltstitel ist hier kein gültiger Ausweis) oder deines deutschen Personalausweises. Unser Community-Team ({{ communityEmail }}) ist in Kopie.\n\nSo füllst du das Formular aus:\n1. Oben rechts neben „Berlin, der“ trägst du das heutige Datum ein.\n2. Links neben „hiermit beantrage ich,“ trägst du deinen Vor- und Nachnamen ein.\n3. „Geb. am“: dein Geburtsdatum (TT.MM.JJJJ) sowie Ort/Bundesland und Land deiner Geburt.\n4. „Wohnhaft“ ist deine aktuelle Berliner Meldeadresse (Anmeldung).\n5. Unter „Mit freundlichen Grüßen,“ schreibst du deinen Namen und unterschreibst zusätzlich.\n\nSobald du uns das unterschriebene Formular geschickt hast, reichen wir den Antrag beim Bezirksamt ein. Das Führungszeugnis kommt in 2–4 Wochen per Post zu dir. Bitte gib uns Bescheid, wenn du es erhalten hast.\n\nFür ein regelmäßiges Engagement in einer Unterkunft brauchst du außerdem einen Nachweis über deine Masernimpfung.\n\nHier findest du zur Info unsere Datenschutzerklärung und die Vereinbarung zur ehrenamtlichen Teilnahme:\n{{ dataPrivacyUrl }}\n{{ agreementUrl }}\n\nSobald wir deine Unterlagen haben, vermitteln wir dich an die Unterkunft und du kannst direkt loslegen.\n\nViele Grüße\n{{ signature }}`,
   },
 };
